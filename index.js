@@ -7,8 +7,11 @@ require('dotenv').config();
 
 const app = express();
 
-// Middleware
-app.use(cors());
+// Middleware (Updated CORS for Vercel)
+app.use(cors({
+    origin: ['http://localhost:3000', 'https://creative-kids-frontend.vercel.app'],
+    credentials: true
+}));
 app.use(express.json());
 
 // JWT Secret Key (Used for keeping users logged in safely)
@@ -18,14 +21,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'creative_kids_super_secret_key_123
 // 1. PRODUCT ROUTES
 // ==========================================
 
-// ==========================================
-// 1. PRODUCT ROUTES
-// ==========================================
-
 // GET: All Products
 app.get('/api/products', async (req, res) => {
   try {
-    // Upgraded: We grab EVERYTHING directly from the products table now!
     const query = `SELECT * FROM products ORDER BY id DESC;`;
     const allProducts = await pool.query(query);
     res.json(allProducts.rows);
@@ -39,7 +37,7 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const query = `SELECT * FROM products WHERE id = ₹1;`;
+    const query = `SELECT * FROM products WHERE id = $1;`;
     const product = await pool.query(query, [id]);
 
     if (product.rows.length === 0) {
@@ -53,7 +51,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// ... Keep your app.post("/api/products") exactly as it is below this!
+// POST: Add new product
 app.post("/api/products", async (req, res) => {
   try {
     const {
@@ -70,7 +68,7 @@ app.post("/api/products", async (req, res) => {
         manufacturer_details, care_instructions, origin_country,
         main_category, sub_category, item_type, category, variants
       ) 
-      VALUES (₹1, ₹2, ₹3, ₹4, ₹5, ₹6, ₹7, ₹8, ₹9, ₹10, ₹11, ₹12, ₹13, ₹14, ₹15, ₹16, ₹17, ₹18, ₹19, ₹20, ₹21, ₹22, ₹23, ₹24, ₹25) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) 
       RETURNING *;
     `;
 
@@ -89,6 +87,7 @@ app.post("/api/products", async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 // PUT: Update an existing product
 app.put("/api/products/:id", async (req, res) => {
   try {
@@ -102,12 +101,12 @@ app.put("/api/products/:id", async (req, res) => {
 
     const query = `
       UPDATE products SET 
-        title = ₹1, description = ₹2, price = ₹3, mrp = ₹4, image_urls = ₹5, sizes = ₹6, colors = ₹7, 
-        is_featured = ₹8, is_new_arrival = ₹9, homepage_section = ₹10, homepage_card_slot = ₹11,
-        sku = ₹12, hsn_code = ₹13, fabric = ₹14, pattern = ₹15, neck_type = ₹16, belt_included = ₹17, 
-        manufacturer_details = ₹18, care_instructions = ₹19, origin_country = ₹20,
-        main_category = ₹21, sub_category = ₹22, item_type = ₹23, category = ₹24, variants = ₹25
-      WHERE id = ₹26 RETURNING *;
+        title = $1, description = $2, price = $3, mrp = $4, image_urls = $5, sizes = $6, colors = $7, 
+        is_featured = $8, is_new_arrival = $9, homepage_section = $10, homepage_card_slot = $11,
+        sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17, 
+        manufacturer_details = $18, care_instructions = $19, origin_country = $20,
+        main_category = $21, sub_category = $22, item_type = $23, category = $24, variants = $25
+      WHERE id = $26 RETURNING *;
     `;
 
     const values = [
@@ -130,13 +129,14 @@ app.put("/api/products/:id", async (req, res) => {
 app.delete("/api/products/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("DELETE FROM products WHERE id = ₹1", [id]);
+    await pool.query("DELETE FROM products WHERE id = $1", [id]);
     res.json({ message: "Product deleted successfully" });
   } catch (err) {
     console.error("Delete Product Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 // ==========================================
 // 2. ADMIN DASHBOARD ROUTES
 // ==========================================
@@ -159,24 +159,18 @@ app.get("/api/admin/stats", async (req, res) => {
   }
 });
 
-
 // ==========================================
-// 3. ORDER ROUTES
-// ==========================================
-// ==========================================
-// 2. ORDER ROUTES (ADVANCED)
+// 3. ORDER ROUTES (ADVANCED)
 // ==========================================
 
-// POST: Create a new order from Checkout
 // POST: Create a new order from Checkout
 app.post("/api/orders", async (req, res) => {
   try {
-    // ADDED userEmail here
     const { cartItems, totalAmount, address, paymentMethod, userEmail } = req.body;
 
     const insertQuery = `
       INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
-      VALUES (₹1, ₹2, ₹3, ₹4, ₹5, ₹6, ₹7, ₹8, ₹9) RETURNING id;
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;
     `;
     const values = [
       address.fullName, address.phone, totalAmount, cartItems.length,
@@ -186,9 +180,9 @@ app.post("/api/orders", async (req, res) => {
     const result = await pool.query(insertQuery, values);
     const newId = result.rows[0].id;
 
-    const orderNumber = `Creativekids-O-₹{String(newId).padStart(6, '0')}`;
+    const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
 
-    await pool.query(`UPDATE orders SET order_number = ₹1 WHERE id = ₹2`, [orderNumber, newId]);
+    await pool.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
 
     res.json({ success: true, order_number: orderNumber });
   } catch (err) {
@@ -197,16 +191,17 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// NEW ROUTE: Fetch orders specifically for the logged-in customer's profile
+// Fetch orders specifically for the logged-in customer's profile
 app.get("/api/orders/user/:email", async (req, res) => {
   try {
     const { email } = req.params;
-    const result = await pool.query("SELECT * FROM orders WHERE user_email = ₹1 ORDER BY id DESC", [email]);
+    const result = await pool.query("SELECT * FROM orders WHERE user_email = $1 ORDER BY id DESC", [email]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ==========================================
 // 4. AUTHENTICATION & USER ROUTES
 // ==========================================
@@ -216,7 +211,7 @@ app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    const userExists = await pool.query("SELECT * FROM users WHERE email = ₹1", [email]);
+    const userExists = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (userExists.rows.length > 0) {
       return res.status(400).json({ message: "User already exists with that email" });
     }
@@ -226,7 +221,7 @@ app.post("/api/auth/register", async (req, res) => {
     const bcryptPassword = await bcrypt.hash(password, salt);
 
     const newUser = await pool.query(
-      "INSERT INTO users (name, email, password) VALUES (₹1, ₹2, ₹3) RETURNING id, name, email",
+      "INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email",
       [name, email, bcryptPassword]
     );
 
@@ -244,7 +239,7 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await pool.query("SELECT * FROM users WHERE email = ₹1", [email]);
+    const user = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (user.rows.length === 0) {
       return res.status(401).json({ message: "Invalid Email or Password" });
     }
@@ -263,7 +258,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-
 // ==========================================
 // 5. SECURE USER PROFILE ROUTES
 // ==========================================
@@ -271,13 +265,13 @@ app.post("/api/auth/login", async (req, res) => {
 // Middleware to verify the user's digital wristband (JWT)
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
+  const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) return res.status(401).json({ message: "Access Denied. No token provided." });
 
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ message: "Invalid or expired token." });
-    req.user = decoded.user; // Attach the user ID to the request
+    req.user = decoded.user;
     next();
   });
 };
@@ -287,7 +281,7 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const userOrders = await pool.query(
-      "SELECT * FROM orders WHERE user_id = ₹1 ORDER BY created_at DESC",
+      "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
       [userId]
     );
     res.json(userOrders.rows);
@@ -296,7 +290,6 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
-
 
 // ==========================================
 // 6. WISHLIST ROUTES
@@ -308,7 +301,7 @@ app.get('/api/wishlist/check/:productId', authenticateToken, async (req, res) =>
     const userId = req.user.id;
     const { productId } = req.params;
 
-    const check = await pool.query("SELECT * FROM wishlist WHERE user_id = ₹1 AND product_id = ₹2", [userId, productId]);
+    const check = await pool.query("SELECT * FROM wishlist WHERE user_id = $1 AND product_id = $2", [userId, productId]);
     res.json({ isWishlisted: check.rows.length > 0 });
   } catch (err) {
     console.error("Wishlist Check Error:", err.message);
@@ -322,13 +315,13 @@ app.post('/api/wishlist/toggle', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const { productId } = req.body;
 
-    const check = await pool.query("SELECT * FROM wishlist WHERE user_id = ₹1 AND product_id = ₹2", [userId, productId]);
+    const check = await pool.query("SELECT * FROM wishlist WHERE user_id = $1 AND product_id = $2", [userId, productId]);
 
     if (check.rows.length > 0) {
-      await pool.query("DELETE FROM wishlist WHERE user_id = ₹1 AND product_id = ₹2", [userId, productId]);
+      await pool.query("DELETE FROM wishlist WHERE user_id = $1 AND product_id = $2", [userId, productId]);
       res.json({ message: "Removed from wishlist", isWishlisted: false });
     } else {
-      await pool.query("INSERT INTO wishlist (user_id, product_id) VALUES (₹1, ₹2)", [userId, productId]);
+      await pool.query("INSERT INTO wishlist (user_id, product_id) VALUES ($1, $2)", [userId, productId]);
       res.json({ message: "Added to wishlist", isWishlisted: true });
     }
   } catch (err) {
@@ -345,7 +338,7 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
       SELECT p.id, p.title, p.price, p.mrp, p.image_urls, p.category, w.created_at 
       FROM products p
       JOIN wishlist w ON p.id = w.product_id
-      WHERE w.user_id = ₹1
+      WHERE w.user_id = $1
       ORDER BY w.created_at DESC;
     `;
     const result = await pool.query(query, [userId]);
@@ -355,6 +348,7 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 // ==========================================
 // 7. SECURE ADMIN AUTHENTICATION
 // ==========================================
@@ -362,12 +356,10 @@ app.post("/api/admin/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // MASTER ADMIN CREDENTIALS (You can change these later)
     const ADMIN_EMAIL = "admin@creativekids.com";
     const ADMIN_PASSWORD = "admin";
 
     if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-      // Create a special token just for the admin
       const token = jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "12h" });
       res.json({ success: true, token });
     } else {
@@ -378,6 +370,7 @@ app.post("/api/admin/login", async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 // ==========================================
 // DEDICATED ADMIN ORDER ROUTES 
 // ==========================================
@@ -407,10 +400,11 @@ app.put("/api/admin/orders/:id/status", async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 // ==========================================
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`Creative Kids backend is running securely on port ₹{PORT}`);
+  console.log(`Creative Kids backend is running securely on port ${PORT}`);
 });
