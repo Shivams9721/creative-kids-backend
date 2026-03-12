@@ -9,7 +9,7 @@ const app = express();
 
 // Middleware (Updated CORS for Vercel)
 app.use(cors({
-    origin: ['http://localhost:3000', 'https://creative-kids-frontend.vercel.app'],
+    origin: ['https://main.d1ucppcuwyaa0p.amplifyapp.com', 'http://localhost:3000'], // Allow both frontend and local development
     credentials: true
 }));
 app.use(express.json());
