@@ -7,14 +7,16 @@ require('dotenv').config();
 
 const app = express();
 
-// Middleware (Updated CORS for Vercel)
+// Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
-    origin: [''http://localhost:3000', 
-      'https://main.d1ucppcuwyaa0p.amplifyapp.com', // Your AWS Amplify link
-      'https://creativekids.com',                   // Your NEW GoDaddy Domain
+    origin: [
+      'http://localhost:3000', 
+      'https://main.d1ucppcuwyaa0p.amplifyapp.com', // AWS Amplify link
+      'https://creativekids.com',                   // Old Domain
       'https://www.creativekids.com',
-      'https://creativekids.co.in',                // (Add the www version too!)'
-      'https://www.creativekids.co.in'], 
+      'https://creativekids.co.in',                 // NEW GoDaddy Domain
+      'https://www.creativekids.co.in'              // NEW GoDaddy Subdomain
+    ], 
     credentials: true
 }));
 app.use(express.json());
@@ -355,19 +357,31 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 7. SECURE ADMIN AUTHENTICATION
+// 7. SECURE ADMIN AUTHENTICATION (DATABASE CONNECTED)
 // ==========================================
 app.post("/api/admin/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const ADMIN_EMAIL = "admin@creativekids.com";
-    const ADMIN_PASSWORD = "admin";
+    // 1. Search the database for this email, BUT only if they have the 'admin' role
+    const adminCheck = await pool.query(
+      "SELECT * FROM users WHERE email = $1 AND role = 'admin'", 
+      [email]
+    );
 
-    if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-      const token = jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "12h" });
+    // 2. If no admin is found with that email, block them
+    if (adminCheck.rows.length === 0) {
+      return res.status(401).json({ error: "Unauthorized", message: "Invalid Admin Credentials" });
+    }
+
+    // 3. Check if the password they typed matches the one we saved in pgAdmin
+    const dbAdmin = adminCheck.rows[0];
+    if (password === dbAdmin.password) {
+      // Success! Give them the VIP wristband (Token)
+      const token = jwt.sign({ role: "admin", id: dbAdmin.id }, JWT_SECRET, { expiresIn: "12h" });
       res.json({ success: true, token });
     } else {
+      // Wrong password
       res.status(401).json({ error: "Unauthorized", message: "Invalid Admin Credentials" });
     }
   } catch (err) {
@@ -377,7 +391,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 // ==========================================
-// DEDICATED ADMIN ORDER ROUTES 
+// 8. DEDICATED ADMIN ORDER ROUTES 
 // ==========================================
 
 // 1. Fetch all orders (specifically for the Admin Dashboard)
