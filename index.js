@@ -9,7 +9,11 @@ const app = express();
 
 // Middleware (Updated CORS for Vercel)
 app.use(cors({
-    origin: ['https://main.d1ucppcuwyaa0p.amplifyapp.com', 'http://localhost:3000'], // Allow both frontend and local development
+    origin: [''http://localhost:3000', 
+      'https://main.d1ucppcuwyaa0p.amplifyapp.com', // Your AWS Amplify link
+      'https://creativekids.com',                   // Your NEW GoDaddy Domain
+      'https://www.creativekids.com'                // (Add the www version too!)'
+       ], 
     credentials: true
 }));
 app.use(express.json());
