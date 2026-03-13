@@ -11,8 +11,10 @@ const app = express();
 app.use(cors({
     origin: [''http://localhost:3000', 
       'https://main.d1ucppcuwyaa0p.amplifyapp.com', // Your AWS Amplify link
-      'https://creativekids.co.in',       // Your root domain
-      'https://www.creativekids.co.in' 
+      'https://creativekids.com',                   // Your NEW GoDaddy Domain
+      'https://www.creativekids.com',
+      'https://creativekids.co.in',                // (Add the www version too!)'
+      'https://www.creativekids.co.in'], 
     credentials: true
 }));
 app.use(express.json());
