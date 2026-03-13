@@ -1,18 +1,27 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// 1. Get the database link from your environment variables
-let dbUrl = process.env.DATABASE_URL || "";
+// 1. Safely grab the URL from AWS
+let connectionString = process.env.DATABASE_URL || "";
+connectionString = connectionString.replace("?sslmode=require", "");
 
-// 2. Forcefully remove the strict SSL command from the URL if it is there
-dbUrl = dbUrl.replace("?sslmode=require", "");
-
-// 3. Connect using our custom, AWS-friendly SSL settings
+// 2. Configure the Professional Connection Pool
 const pool = new Pool({
-    connectionString: dbUrl,
+    connectionString: connectionString,
     ssl: {
-        rejectUnauthorized: false
-    }
+        rejectUnauthorized: false // Allows connection to AWS RDS
+    },
+    
+    // --- SECURITY & PERFORMANCE SAFEGUARDS ---
+    max: 20,                      // Maximum number of simultaneous connections allowed
+    idleTimeoutMillis: 30000,     // Close connections automatically after 30 seconds of inactivity
+    connectionTimeoutMillis: 5000 // If DB doesn't respond in 5 seconds, fail gracefully instead of freezing
+});
+
+// 3. Secure Error Handling (Prevents sensitive data leaks)
+pool.on('error', (err, client) => {
+    // We only log the safe message, NOT the full error object which might contain passwords
+    console.error('❌ Database connection error on idle client:', err.message);
 });
 
 module.exports = pool;
