@@ -32,7 +32,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'creative_kids_super_secret_key_123
 // ==========================================
 
 // Middleware to verify the user's digital wristband (JWT)
-// WE MOVED THIS UP HERE so the AWS Upload route can use it safely!
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -42,6 +41,20 @@ const authenticateToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ message: "Invalid or expired token." });
     req.user = decoded.user;
+    next();
+  });
+};
+
+// Middleware to verify admin token
+const authenticateAdmin = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ message: "Access Denied. No token provided." });
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err || decoded.role !== 'admin') return res.status(403).json({ message: "Invalid or expired admin token." });
+    req.admin = decoded;
     next();
   });
 };
@@ -64,7 +77,7 @@ const s3 = new S3Client({
 const upload = multer({ storage: multer.memoryStorage() });
 
 // 3. The Upload API Route
-app.post('/api/upload', authenticateToken, upload.single('image'), async (req, res) => {
+app.post('/api/upload', authenticateAdmin, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No image file provided." });
