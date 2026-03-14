@@ -4,7 +4,7 @@ const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
@@ -76,7 +76,24 @@ const s3 = new S3Client({
 // 2. Configure Multer (Temporarily holds the image in RAM)
 const upload = multer({ storage: multer.memoryStorage() });
 
-// 3. The Upload API Route
+// 3. Delete a single image from S3
+app.delete('/api/upload', authenticateAdmin, async (req, res) => {
+  try {
+    const { imageUrl } = req.body;
+    if (!imageUrl) return res.status(400).json({ error: "No imageUrl provided." });
+
+    // Extract the S3 key from the full URL
+    const key = imageUrl.split('.amazonaws.com/')[1];
+    await s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_S3_BUCKET_NAME, Key: key }));
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("S3 Delete Error:", error);
+    res.status(500).json({ error: "Failed to delete image from cloud storage." });
+  }
+});
+
+// 4. The Upload API Route
 app.post('/api/upload', authenticateAdmin, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -224,10 +241,25 @@ app.put("/api/products/:id", async (req, res) => {
   }
 });
 
-// DELETE: Remove a product entirely
+// DELETE: Remove a product entirely (also deletes its S3 images)
 app.delete("/api/products/:id", async (req, res) => {
   try {
     const { id } = req.params;
+
+    // Fetch image URLs before deleting the product
+    const product = await pool.query("SELECT image_urls FROM products WHERE id = $1", [id]);
+    if (product.rows.length > 0) {
+      let imageUrls = [];
+      try { imageUrls = typeof product.rows[0].image_urls === 'string' ? JSON.parse(product.rows[0].image_urls) : (product.rows[0].image_urls || []); } catch(e) {}
+
+      if (imageUrls.length > 0) {
+        const objects = imageUrls.map(url => ({ Key: url.split('.amazonaws.com/')[1] })).filter(o => o.Key);
+        if (objects.length > 0) {
+          await s3.send(new DeleteObjectsCommand({ Bucket: process.env.AWS_S3_BUCKET_NAME, Delete: { Objects: objects } }));
+        }
+      }
+    }
+
     await pool.query("DELETE FROM products WHERE id = $1", [id]);
     res.json({ message: "Product deleted successfully" });
   } catch (err) {
