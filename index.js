@@ -28,6 +28,26 @@ const JWT_SECRET = process.env.JWT_SECRET || 'creative_kids_super_secret_key_123
 
 
 // ==========================================
+// GLOBAL SECURITY MIDDLEWARE
+// ==========================================
+
+// Middleware to verify the user's digital wristband (JWT)
+// WE MOVED THIS UP HERE so the AWS Upload route can use it safely!
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ message: "Access Denied. No token provided." });
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ message: "Invalid or expired token." });
+    req.user = decoded.user;
+    next();
+  });
+};
+
+
+// ==========================================
 // AWS S3 IMAGE UPLOAD SETUP
 // ==========================================
 
@@ -73,6 +93,8 @@ app.post('/api/upload', authenticateToken, upload.single('image'), async (req, r
     res.status(500).json({ error: "Failed to upload image to cloud storage." });
   }
 });
+
+
 // ==========================================
 // 1. PRODUCT ROUTES
 // ==========================================
@@ -129,7 +151,11 @@ app.post("/api/products", async (req, res) => {
     `;
 
     const values = [
-      title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+      title, description, price, mrp, 
+      JSON.stringify(image_urls), 
+      JSON.stringify(sizes), 
+      JSON.stringify(colors), 
+      is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, sub_category,
@@ -166,7 +192,11 @@ app.put("/api/products/:id", async (req, res) => {
     `;
 
     const values = [
-      title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+      title, description, price, mrp, 
+      JSON.stringify(image_urls), 
+      JSON.stringify(sizes), 
+      JSON.stringify(colors), 
+      is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, sub_category,
@@ -193,6 +223,7 @@ app.delete("/api/products/:id", async (req, res) => {
   }
 });
 
+
 // ==========================================
 // 2. ADMIN DASHBOARD ROUTES
 // ==========================================
@@ -214,6 +245,7 @@ app.get("/api/admin/stats", async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 
 // ==========================================
 // 3. ORDER ROUTES (ADVANCED)
@@ -257,6 +289,7 @@ app.get("/api/orders/user/:email", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ==========================================
 // 4. AUTHENTICATION & USER ROUTES
@@ -314,23 +347,10 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
+
 // ==========================================
 // 5. SECURE USER PROFILE ROUTES
 // ==========================================
-
-// Middleware to verify the user's digital wristband (JWT)
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) return res.status(401).json({ message: "Access Denied. No token provided." });
-
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).json({ message: "Invalid or expired token." });
-    req.user = decoded.user;
-    next();
-  });
-};
 
 // GET: Fetch ONLY the logged-in user's orders
 app.get('/api/user/orders', authenticateToken, async (req, res) => {
@@ -346,6 +366,7 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 
 // ==========================================
 // 6. WISHLIST ROUTES
@@ -405,8 +426,9 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
   }
 });
 
+
 // ==========================================
-// 7. SECURE ADMIN AUTHENTICATION (DATABASE CONNECTED)
+// 7. SECURE ADMIN AUTHENTICATION
 // ==========================================
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -439,6 +461,7 @@ app.post("/api/admin/login", async (req, res) => {
   }
 });
 
+
 // ==========================================
 // 8. DEDICATED ADMIN ORDER ROUTES 
 // ==========================================
@@ -468,6 +491,7 @@ app.put("/api/admin/orders/:id/status", async (req, res) => {
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
+
 
 // ==========================================
 // START SERVER
