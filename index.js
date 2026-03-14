@@ -560,6 +560,92 @@ app.put("/api/admin/orders/:id/status", async (req, res) => {
 
 
 // ==========================================
+// 9. REVIEWS ROUTES (VERIFIED BUYERS ONLY)
+// ==========================================
+
+// GET: Fetch all reviews for a product
+app.get('/api/reviews/:productId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC',
+      [req.params.productId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Check if logged-in user can review (verified buyer + not already reviewed)
+app.get('/api/reviews/check/:productId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { productId } = req.params;
+
+    // Get user email
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.json({ canReview: false });
+    const email = userRes.rows[0].email;
+
+    // Check if user has ordered this product
+    const orderRes = await pool.query(
+      `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
+      [email, `%"id":${productId}%`]
+    );
+    const hasBought = orderRes.rows.length > 0;
+
+    // Check if already reviewed
+    const reviewRes = await pool.query(
+      'SELECT id FROM reviews WHERE user_id = $1 AND product_id = $2',
+      [userId, productId]
+    );
+    const alreadyReviewed = reviewRes.rows.length > 0;
+
+    res.json({ canReview: hasBought && !alreadyReviewed, alreadyReviewed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST: Submit a review (verified buyers only)
+app.post('/api/reviews', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { productId, rating, comment } = req.body;
+
+    // Get user info
+    const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const { name, email } = userRes.rows[0];
+
+    // Verify buyer
+    const orderRes = await pool.query(
+      `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
+      [email, `%"id":${productId}%`]
+    );
+    if (orderRes.rows.length === 0)
+      return res.status(403).json({ error: 'Only verified buyers can review this product.' });
+
+    // Prevent duplicate review
+    const existing = await pool.query(
+      'SELECT id FROM reviews WHERE user_id = $1 AND product_id = $2',
+      [userId, productId]
+    );
+    if (existing.rows.length > 0)
+      return res.status(400).json({ error: 'You have already reviewed this product.' });
+
+    const result = await pool.query(
+      'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [productId, userId, name, rating, comment]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
