@@ -129,11 +129,10 @@ app.post('/api/upload', authenticateAdmin, upload.single('image'), async (req, r
 // 1. PRODUCT ROUTES
 // ==========================================
 
-// GET: All Products
+// GET: All Products (only active ones for storefront)
 app.get('/api/products', async (req, res) => {
   try {
-    const query = `SELECT * FROM products ORDER BY id DESC;`;
-    const allProducts = await pool.query(query);
+    const allProducts = await pool.query(`SELECT * FROM products WHERE is_active = true ORDER BY id DESC;`);
     res.json(allProducts.rows);
   } catch (err) {
     console.error("Products GET Error:", err.message);
@@ -241,27 +240,12 @@ app.put("/api/products/:id", async (req, res) => {
   }
 });
 
-// DELETE: Remove a product entirely (also deletes its S3 images)
+// DELETE: Soft delete — hides product from storefront but keeps order history intact
 app.delete("/api/products/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
-    // Fetch image URLs before deleting the product
-    const product = await pool.query("SELECT image_urls FROM products WHERE id = $1", [id]);
-    if (product.rows.length > 0) {
-      let imageUrls = [];
-      try { imageUrls = typeof product.rows[0].image_urls === 'string' ? JSON.parse(product.rows[0].image_urls) : (product.rows[0].image_urls || []); } catch(e) {}
-
-      if (imageUrls.length > 0) {
-        const objects = imageUrls.map(url => ({ Key: url.split('.amazonaws.com/')[1] })).filter(o => o.Key);
-        if (objects.length > 0) {
-          await s3.send(new DeleteObjectsCommand({ Bucket: process.env.AWS_S3_BUCKET_NAME, Delete: { Objects: objects } }));
-        }
-      }
-    }
-
-    await pool.query("DELETE FROM products WHERE id = $1", [id]);
-    res.json({ message: "Product deleted successfully" });
+    await pool.query("UPDATE products SET is_active = false WHERE id = $1", [id]);
+    res.json({ message: "Product removed from storefront" });
   } catch (err) {
     console.error("Delete Product Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
@@ -272,6 +256,16 @@ app.delete("/api/products/:id", async (req, res) => {
 // ==========================================
 // 2. ADMIN DASHBOARD ROUTES
 // ==========================================
+
+// GET: All products for Admin (including soft-deleted)
+app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
+  try {
+    const allProducts = await pool.query(`SELECT * FROM products ORDER BY id DESC;`);
+    res.json(allProducts.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Server Error", details: err.message });
+  }
+});
 
 // GET: Live stats for the Admin Overview Panel
 app.get("/api/admin/stats", async (req, res) => {
@@ -296,31 +290,52 @@ app.get("/api/admin/stats", async (req, res) => {
 // 3. ORDER ROUTES (ADVANCED)
 // ==========================================
 
-// POST: Create a new order from Checkout
+// POST: Create a new order + deduct stock
 app.post("/api/orders", async (req, res) => {
+  const client = await pool.connect();
   try {
     const { cartItems, totalAmount, address, paymentMethod, userEmail } = req.body;
 
-    const insertQuery = `
-      INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;
-    `;
-    const values = [
-      address.fullName, address.phone, totalAmount, cartItems.length,
-      'Processing', JSON.stringify(address), JSON.stringify(cartItems), paymentMethod, userEmail || 'guest'
-    ];
+    await client.query('BEGIN');
 
-    const result = await pool.query(insertQuery, values);
+    // 1. Deduct stock for each cart item
+    for (const item of cartItems) {
+      const productRes = await client.query("SELECT variants FROM products WHERE id = $1", [item.id]);
+      if (productRes.rows.length > 0) {
+        let variants = [];
+        try { variants = typeof productRes.rows[0].variants === 'string' ? JSON.parse(productRes.rows[0].variants) : (productRes.rows[0].variants || []); } catch(e) {}
+
+        const updated = variants.map(v => {
+          const colorMatch = !item.color || v.color === item.color || v.color === item.selectedColor || v.color === 'Default';
+          const sizeMatch = !item.size || v.size === item.size || v.size === item.selectedSize || v.size === 'Default';
+          if (colorMatch && sizeMatch && v.stock > 0) {
+            return { ...v, stock: v.stock - (item.quantity || 1) };
+          }
+          return v;
+        });
+        await client.query("UPDATE products SET variants = $1 WHERE id = $2", [JSON.stringify(updated), item.id]);
+      }
+    }
+
+    // 2. Insert the order
+    const result = await client.query(
+      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;`,
+      [address.fullName, address.phone, totalAmount, cartItems.length, 'Processing',
+       JSON.stringify(address), JSON.stringify(cartItems), paymentMethod, userEmail || 'guest']
+    );
     const newId = result.rows[0].id;
-
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
+    await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
 
-    await pool.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
-
+    await client.query('COMMIT');
     res.json({ success: true, order_number: orderNumber });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error("Create Order Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -479,25 +494,31 @@ app.post("/api/admin/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // 1. Search the database for this email, BUT only if they have the 'admin' role
     const adminCheck = await pool.query(
-      "SELECT * FROM users WHERE email = $1 AND role = 'admin'", 
-      [email]
+      "SELECT * FROM users WHERE email = $1 AND role = 'admin'", [email]
     );
-
-    // 2. If no admin is found with that email, block them
     if (adminCheck.rows.length === 0) {
       return res.status(401).json({ error: "Unauthorized", message: "Invalid Admin Credentials" });
     }
 
-    // 3. Check if the password they typed matches the one we saved in pgAdmin
     const dbAdmin = adminCheck.rows[0];
-    if (password === dbAdmin.password) {
-      // Success! Give them the VIP wristband (Token)
+    // Support both bcrypt hashed and plain-text passwords (migration safe)
+    let isValid = false;
+    if (dbAdmin.password.startsWith('$2b$') || dbAdmin.password.startsWith('$2a$')) {
+      isValid = await bcrypt.compare(password, dbAdmin.password);
+    } else {
+      isValid = (password === dbAdmin.password);
+      // Auto-upgrade to bcrypt on first login
+      if (isValid) {
+        const hashed = await bcrypt.hash(password, 10);
+        await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashed, dbAdmin.id]);
+      }
+    }
+
+    if (isValid) {
       const token = jwt.sign({ role: "admin", id: dbAdmin.id }, JWT_SECRET, { expiresIn: "12h" });
       res.json({ success: true, token });
     } else {
-      // Wrong password
       res.status(401).json({ error: "Unauthorized", message: "Invalid Admin Credentials" });
     }
   } catch (err) {
@@ -522,13 +543,13 @@ app.get("/api/admin/orders", async (req, res) => {
   }
 });
 
-// 2. Update order status (specifically for the Admin Dashboard)
+// 2. Update order status + AWB tracking number
 app.put("/api/admin/orders/:id/status", async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, courier_name, awb_number } = req.body;
     const result = await pool.query(
-      "UPDATE orders SET status = $1 WHERE id = $2 RETURNING *", 
-      [status, req.params.id]
+      "UPDATE orders SET status = $1, courier_name = $2, awb_number = $3 WHERE id = $4 RETURNING *",
+      [status, courier_name || null, awb_number || null, req.params.id]
     );
     res.json({ success: true, order: result.rows[0] });
   } catch (err) {
