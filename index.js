@@ -3,6 +3,8 @@ const cors = require('cors');
 const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
@@ -24,6 +26,53 @@ app.use(express.json());
 // JWT Secret Key (Used for keeping users logged in safely)
 const JWT_SECRET = process.env.JWT_SECRET || 'creative_kids_super_secret_key_123!';
 
+
+// ==========================================
+// AWS S3 IMAGE UPLOAD SETUP
+// ==========================================
+
+// 1. Configure AWS S3 Client
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+// 2. Configure Multer (Temporarily holds the image in RAM)
+const upload = multer({ storage: multer.memoryStorage() });
+
+// 3. The Upload API Route
+app.post('/api/upload', authenticateToken, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No image file provided." });
+    }
+
+    // Create a unique file name so images don't overwrite each other
+    const fileExtension = req.file.originalname.split('.').pop();
+    const fileName = `products/${Date.now()}-${Math.round(Math.random() * 1E9)}.${fileExtension}`;
+
+    // Command to send the file to AWS S3
+    const command = new PutObjectCommand({
+      Bucket: process.env.AWS_S3_BUCKET_NAME,
+      Key: fileName,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    });
+
+    await s3.send(command);
+
+    // Create the public URL to save in the database
+    const imageUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+
+    res.json({ success: true, imageUrl: imageUrl });
+  } catch (error) {
+    console.error("AWS S3 Upload Error:", error);
+    res.status(500).json({ error: "Failed to upload image to cloud storage." });
+  }
+});
 // ==========================================
 // 1. PRODUCT ROUTES
 // ==========================================
