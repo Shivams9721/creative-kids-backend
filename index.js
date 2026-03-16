@@ -659,6 +659,101 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
 
 
 // ==========================================
+// 10. ADVANCED ANALYTICS ROUTES
+// ==========================================
+
+// GET: Revenue by day (last 30 days)
+app.get('/api/admin/analytics/revenue', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT DATE(created_at) as date, SUM(total_amount) as revenue, COUNT(*) as orders
+      FROM orders
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Top selling products
+app.get('/api/admin/analytics/top-products', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.id, p.title, p.sku, p.price, p.image_urls,
+        COUNT(DISTINCT o.id) as order_count,
+        SUM(o.total_amount) as total_revenue
+      FROM products p
+      JOIN orders o ON o.items::text LIKE '%"id":' || p.id || '%'
+      WHERE o.status != 'Cancelled'
+      GROUP BY p.id
+      ORDER BY order_count DESC
+      LIMIT 10
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Order status breakdown
+app.get('/api/admin/analytics/order-funnel', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT status, COUNT(*) as count, SUM(total_amount) as value
+      FROM orders
+      GROUP BY status
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Full admin stats (enhanced)
+app.get('/api/admin/stats/full', authenticateAdmin, async (req, res) => {
+  try {
+    const [revenue, orders, products, todayOrders, lowStock] = await Promise.all([
+      pool.query("SELECT SUM(total_amount) as total, COUNT(*) as count FROM orders WHERE status != 'Cancelled'"),
+      pool.query("SELECT COUNT(*) FROM orders WHERE status NOT IN ('Delivered','Cancelled')"),
+      pool.query("SELECT COUNT(*) FROM products WHERE is_active = true"),
+      pool.query("SELECT COUNT(*), SUM(total_amount) FROM orders WHERE DATE(created_at) = CURRENT_DATE"),
+      pool.query(`SELECT COUNT(*) FROM products WHERE is_active = true AND (
+        SELECT COALESCE(SUM((v->>'stock')::int), 0) FROM jsonb_array_elements(variants::jsonb) v
+      ) < 10`)
+    ]);
+    res.json({
+      totalRevenue: parseFloat(revenue.rows[0].total) || 0,
+      totalOrders: parseInt(revenue.rows[0].count) || 0,
+      activeOrders: parseInt(orders.rows[0].count) || 0,
+      totalProducts: parseInt(products.rows[0].count) || 0,
+      todayOrders: parseInt(todayOrders.rows[0].count) || 0,
+      todayRevenue: parseFloat(todayOrders.rows[0].sum) || 0,
+      lowStockProducts: parseInt(lowStock.rows[0].count) || 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Search orders
+app.get('/api/admin/orders/search', authenticateAdmin, async (req, res) => {
+  try {
+    const { q } = req.query;
+    const result = await pool.query(
+      `SELECT * FROM orders WHERE order_number ILIKE $1 OR customer_name ILIKE $1 OR user_email ILIKE $1 OR phone ILIKE $1 ORDER BY id DESC LIMIT 20`,
+      [`%${q}%`]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
