@@ -563,19 +563,6 @@ app.put("/api/admin/orders/:id/status", async (req, res) => {
 // 9. REVIEWS ROUTES (VERIFIED BUYERS ONLY)
 // ==========================================
 
-// GET: Fetch all reviews for a product
-app.get('/api/reviews/:productId', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC',
-      [req.params.productId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // GET: Check if logged-in user can review (verified buyer + not already reviewed)
 app.get('/api/reviews/check/:productId', authenticateToken, async (req, res) => {
   try {
@@ -602,6 +589,19 @@ app.get('/api/reviews/check/:productId', authenticateToken, async (req, res) => 
     const alreadyReviewed = reviewRes.rows.length > 0;
 
     res.json({ canReview: hasBought && !alreadyReviewed, alreadyReviewed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Fetch all reviews for a product
+app.get('/api/reviews/:productId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE product_id = $1 ORDER BY created_at DESC',
+      [req.params.productId]
+    );
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
