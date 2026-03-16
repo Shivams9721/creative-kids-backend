@@ -159,7 +159,7 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // POST: Add new product
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", authenticateAdmin, async (req, res) => {
   try {
     const {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
@@ -200,7 +200,7 @@ app.post("/api/products", async (req, res) => {
 });
 
 // PUT: Update an existing product
-app.put("/api/products/:id", async (req, res) => {
+app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -241,7 +241,7 @@ app.put("/api/products/:id", async (req, res) => {
 });
 
 // DELETE: Soft delete — hides product from storefront but keeps order history intact
-app.delete("/api/products/:id", async (req, res) => {
+app.delete("/api/products/:id", authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query("UPDATE products SET is_active = false WHERE id = $1", [id]);
@@ -424,6 +424,19 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("User Orders GET Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
+  }
+});
+
+
+// PUT: Update user profile (name, phone)
+app.put('/api/user/profile', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name, phone } = req.body;
+    await pool.query('UPDATE users SET name = $1, phone = $2 WHERE id = $3', [name, phone, userId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
