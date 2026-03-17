@@ -305,11 +305,13 @@ app.post("/api/orders", async (req, res) => {
         let variants = [];
         try { variants = typeof productRes.rows[0].variants === 'string' ? JSON.parse(productRes.rows[0].variants) : (productRes.rows[0].variants || []); } catch(e) {}
 
+        const itemColor = item.selectedColor || item.color || 'Default';
+        const itemSize = item.selectedSize || item.size || 'Default';
         const updated = variants.map(v => {
-          const colorMatch = !item.color || v.color === item.color || v.color === item.selectedColor || v.color === 'Default';
-          const sizeMatch = !item.size || v.size === item.size || v.size === item.selectedSize || v.size === 'Default';
-          if (colorMatch && sizeMatch && v.stock > 0) {
-            return { ...v, stock: v.stock - (item.quantity || 1) };
+          const colorMatch = v.color === itemColor || (itemColor === 'Default' && v.color === 'Default');
+          const sizeMatch = v.size === itemSize || (itemSize === 'Default' && v.size === 'Default');
+          if (colorMatch && sizeMatch) {
+            return { ...v, stock: Math.max(0, v.stock - (item.quantity || 1)) };
           }
           return v;
         });
@@ -546,7 +548,7 @@ app.post("/api/admin/login", async (req, res) => {
 // ==========================================
 
 // 1. Fetch all orders (specifically for the Admin Dashboard)
-app.get("/api/admin/orders", async (req, res) => {
+app.get("/api/admin/orders", authenticateAdmin, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM orders ORDER BY id DESC");
     res.json(result.rows);
@@ -557,7 +559,7 @@ app.get("/api/admin/orders", async (req, res) => {
 });
 
 // 2. Update order status + AWB tracking number
-app.put("/api/admin/orders/:id/status", async (req, res) => {
+app.put("/api/admin/orders/:id/status", authenticateAdmin, async (req, res) => {
   try {
     const { status, courier_name, awb_number } = req.body;
     const result = await pool.query(
