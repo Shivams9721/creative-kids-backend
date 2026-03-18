@@ -300,7 +300,8 @@ app.get("/api/admin/stats", async (req, res) => {
 app.post("/api/orders", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { cartItems, totalAmount, address, paymentMethod, userEmail } = req.body;
+    const { cartItems, totalAmount, address, paymentMethod, userEmail, couponCode, discountAmount } = req.body;
+    const finalAmount = parseFloat(totalAmount) - (parseFloat(discountAmount) || 0);
 
     await client.query('BEGIN');
 
@@ -327,14 +328,18 @@ app.post("/api/orders", async (req, res) => {
 
     // 2. Insert the order
     const result = await client.query(
-      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;`,
-      [address.fullName, address.phone, totalAmount, cartItems.length, 'Processing',
-       JSON.stringify(address), JSON.stringify(cartItems), paymentMethod, userEmail || 'guest']
+      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email, coupon_code, discount_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id;`,
+      [address.fullName, address.phone, finalAmount, cartItems.length, 'Processing',
+       JSON.stringify(address), JSON.stringify(cartItems), paymentMethod, userEmail || 'guest',
+       couponCode || null, discountAmount || 0]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
     await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
+    if (couponCode) {
+      await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]);
+    }
 
     await client.query('COMMIT');
     res.json({ success: true, order_number: orderNumber });
@@ -411,6 +416,51 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({ token, user: { id: user.rows[0].id, name: user.rows[0].name, email: user.rows[0].email } });
   } catch (err) {
     console.error("Login Error:", err.message);
+    res.status(500).json({ error: "Server Error", details: err.message });
+  }
+});
+
+
+// POST: Forgot Password — generates a reset token
+app.post("/api/auth/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    const userRes = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    // Always return success to prevent email enumeration
+    if (userRes.rows.length === 0) return res.json({ success: true });
+
+    const token = require('crypto').randomBytes(32).toString('hex');
+    const expires = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
+      [userRes.rows[0].id, token, expires]
+    );
+    // In production wire this to AWS SES. For now return token in response (dev only).
+    res.json({ success: true, reset_token: token });
+  } catch (err) {
+    console.error("Forgot Password Error:", err.message);
+    res.status(500).json({ error: "Server Error", details: err.message });
+  }
+});
+
+// POST: Reset Password — validates token and sets new password
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    const result = await pool.query(
+      "SELECT user_id, expires_at FROM password_reset_tokens WHERE token = $1",
+      [token]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ error: "Invalid or expired reset link." });
+    if (new Date() > new Date(result.rows[0].expires_at)) return res.status(400).json({ error: "Reset link has expired." });
+
+    const hashed = await bcrypt.hash(password, 10);
+    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashed, result.rows[0].user_id]);
+    await pool.query("DELETE FROM password_reset_tokens WHERE token = $1", [token]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Reset Password Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
@@ -755,6 +805,98 @@ app.get('/api/admin/orders/search', authenticateAdmin, async (req, res) => {
       [`%${q}%`]
     );
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// POST: Cancel an order (user-initiated, only if Processing)
+app.post('/api/orders/:id/cancel', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const email = userRes.rows[0].email;
+
+    const orderRes = await pool.query(
+      'SELECT * FROM orders WHERE id = $1 AND user_email = $2',
+      [req.params.id, email]
+    );
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+    if (order.status !== 'Processing') return res.status(400).json({ error: 'Only Processing orders can be cancelled.' });
+
+    await pool.query('UPDATE orders SET status = $1 WHERE id = $2', ['Cancelled', order.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// 11. COUPON ROUTES
+// ==========================================
+
+// POST: Validate a coupon code
+app.post('/api/coupons/validate', async (req, res) => {
+  try {
+    const { code, orderAmount } = req.body;
+    const result = await pool.query(
+      `SELECT * FROM coupons WHERE UPPER(code) = UPPER($1) AND is_active = true
+       AND (expires_at IS NULL OR expires_at > NOW())
+       AND (max_uses IS NULL OR uses < max_uses)`,
+      [code]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired coupon.' });
+    const coupon = result.rows[0];
+    if (parseFloat(orderAmount) < parseFloat(coupon.min_order_amount))
+      return res.status(400).json({ error: `Minimum order amount ₹${coupon.min_order_amount} required.` });
+
+    const discount = coupon.discount_type === 'percent'
+      ? Math.round((parseFloat(orderAmount) * parseFloat(coupon.discount_value)) / 100)
+      : parseFloat(coupon.discount_value);
+
+    res.json({ valid: true, discount, discount_type: coupon.discount_type, discount_value: coupon.discount_value, code: coupon.code });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Create coupon
+app.post('/api/admin/coupons', authenticateAdmin, async (req, res) => {
+  try {
+    const { code, discount_type, discount_value, min_order_amount, max_uses, expires_at } = req.body;
+    const result = await pool.query(
+      `INSERT INTO coupons (code, discount_type, discount_value, min_order_amount, max_uses, expires_at)
+       VALUES (UPPER($1), $2, $3, $4, $5, $6) RETURNING *`,
+      [code, discount_type, discount_value, min_order_amount || 0, max_uses || null, expires_at || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: List all coupons
+app.get('/api/admin/coupons', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM coupons ORDER BY id DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Toggle coupon active state
+app.put('/api/admin/coupons/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE coupons SET is_active = NOT is_active WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
