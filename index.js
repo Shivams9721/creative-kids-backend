@@ -165,7 +165,7 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
       manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, variants, extra_categories
+      main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
 
     const query = `
@@ -173,9 +173,9 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
         title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
         sku, hsn_code, fabric, pattern, neck_type, belt_included, 
         manufacturer_details, care_instructions, origin_country,
-        main_category, sub_category, item_type, category, variants, extra_categories
+        main_category, sub_category, item_type, category, variants, extra_categories, color_images
       ) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27) 
       RETURNING *;
     `;
 
@@ -189,7 +189,8 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, sub_category,
       JSON.stringify(variants),
-      JSON.stringify(extra_categories || [])
+      JSON.stringify(extra_categories || []),
+      JSON.stringify(color_images || {})
     ];
 
     const newProduct = await pool.query(query, values);
@@ -208,7 +209,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
       manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, variants, extra_categories
+      main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
 
     const query = `
@@ -218,8 +219,8 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
         sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17, 
         manufacturer_details = $18, care_instructions = $19, origin_country = $20,
         main_category = $21, sub_category = $22, item_type = $23, category = $24, variants = $25,
-        extra_categories = $26
-      WHERE id = $27 RETURNING *;
+        extra_categories = $26, color_images = $27
+      WHERE id = $28 RETURNING *;
     `;
 
     const values = [
@@ -233,6 +234,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       main_category, sub_category, item_type, sub_category,
       JSON.stringify(variants),
       JSON.stringify(extra_categories || []),
+      JSON.stringify(color_images || {}),
       id
     ];
 
