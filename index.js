@@ -318,9 +318,12 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
   }
 });
 
-// DELETE: Soft delete — hides product from storefront but keeps order history intact
+// DELETE: Soft delete — requires explicit { confirm: "DELETE" } in body as a safety guard
 app.delete("/api/products/:id", authenticateAdmin, async (req, res) => {
   try {
+    if (req.body?.confirm !== "DELETE") {
+      return res.status(400).json({ error: "Missing confirmation. Send { confirm: 'DELETE' } to proceed." });
+    }
     const { id } = req.params;
     await pool.query("UPDATE products SET is_active = false WHERE id = $1", [id]);
     res.json({ message: "Product removed from storefront" });
