@@ -9,7 +9,7 @@ connectionString = connectionString.replace("?sslmode=require", "");
 const pool = new Pool({
     connectionString: connectionString,
     ssl: {
-        rejectUnauthorized: false // Allows connection to AWS RDS
+        rejectUnauthorized: true
     },
     
     // --- SECURITY & PERFORMANCE SAFEGUARDS ---

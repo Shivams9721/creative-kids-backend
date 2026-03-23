@@ -30,6 +30,16 @@ const migrations = [
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`,
+  `CREATE TABLE IF NOT EXISTS returns (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER NOT NULL,
+    order_number TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    comments TEXT,
+    status TEXT NOT NULL DEFAULT 'Requested' CHECK (status IN ('Requested','Approved','Rejected','Completed')),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
 ];
 
 (async () => {

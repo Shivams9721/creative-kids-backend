@@ -1,30 +1,94 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const cookieParser = require('cookie-parser');
+const { doubleCsrf } = require('csrf-csrf');
 const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
-const { S3Client, PutObjectCommand, DeleteObjectCommand, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
+
+// Security headers via helmet (all protections enabled)
+app.use(helmet());
 
 // Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
     origin: [
       'http://localhost:3000', 
-      'https://main.d1ucppcuwyaa0p.amplifyapp.com', // AWS Amplify link
-      'https://creativekids.com',                   // Old Domain
+      'https://main.d1ucppcuwyaa0p.amplifyapp.com',
+      'https://creativekids.com',
       'https://www.creativekids.com',
-      'https://creativekids.co.in',                 // NEW GoDaddy Domain
-      'https://www.creativekids.co.in'              // NEW GoDaddy Subdomain
+      'https://creativekids.co.in',
+      'https://www.creativekids.co.in'
     ], 
     credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
+
+// CSRF double-submit cookie protection (csrf-csrf library)
+const CSRF_SECRET = process.env.CSRF_SECRET || crypto.randomBytes(32).toString('hex');
+const { generateToken, doubleCsrfProtection } = doubleCsrf({
+  getSecret: () => CSRF_SECRET,
+  cookieName: 'x-csrf-token',
+  cookieOptions: {
+    sameSite: 'strict',
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+  },
+  size: 64,
+  getTokenFromRequest: (req) => req.headers['x-csrf-token'],
+});
+
+// Expose CSRF token endpoint (called once on app load)
+// nocsrf
+app.get('/api/csrf-token', (req, res) => {
+  const token = generateToken(req, res);
+  res.json({ csrfToken: token });
+});
+
+// Apply CSRF double-submit cookie protection to all mutating routes
+app.use(doubleCsrfProtection);
+
+// ==========================================
+// EMAIL (AWS SES via SMTP)
+// ==========================================
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT) || 587,
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+});
+
+const sendOtpEmail = async (toEmail, otp, purpose) => {
+  const isReset = purpose === 'reset';
+  await mailer.sendMail({
+    from: `"Creative Kids" <${process.env.SES_FROM_EMAIL}>`,
+    to: toEmail,
+    subject: isReset ? 'Reset Your Password — Creative Kids' : 'Your Login OTP — Creative Kids',
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#fff;border:1px solid #eee;border-radius:12px">
+        <h2 style="font-size:20px;font-weight:300;color:#000;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">Creative Kids</h2>
+        <p style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:2px;margin-bottom:32px">Premium Children's Clothing</p>
+        <p style="font-size:14px;color:#333;margin-bottom:24px">${isReset ? 'Use this OTP to reset your password.' : 'Use this OTP to sign in to your account.'} It expires in <strong>10 minutes</strong>.</p>
+        <div style="background:#f6f5f3;border-radius:8px;padding:24px;text-align:center;margin-bottom:24px">
+          <span style="font-size:36px;font-weight:700;letter-spacing:12px;color:#000">${otp}</span>
+        </div>
+        <p style="font-size:12px;color:#999">If you didn't request this, please ignore this email. Do not share this OTP with anyone.</p>
+      </div>
+    `
+  });
+};
 
 // JWT Secret Key (Used for keeping users logged in safely)
-const JWT_SECRET = process.env.JWT_SECRET || 'creative_kids_super_secret_key_123!';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is not set');
 
 
 // ==========================================
@@ -74,7 +138,7 @@ const s3 = new S3Client({
 });
 
 // 2. Configure Multer (Temporarily holds the image in RAM)
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 // 3. Delete a single image from S3
 app.delete('/api/upload', authenticateAdmin, async (req, res) => {
@@ -82,8 +146,11 @@ app.delete('/api/upload', authenticateAdmin, async (req, res) => {
     const { imageUrl } = req.body;
     if (!imageUrl) return res.status(400).json({ error: "No imageUrl provided." });
 
-    // Extract the S3 key from the full URL
-    const key = imageUrl.split('.amazonaws.com/')[1];
+    // Extract and validate the S3 key — must start with 'products/'
+    const parts = imageUrl.split('.amazonaws.com/');
+    if (parts.length < 2) return res.status(400).json({ error: 'Invalid image URL.' });
+    const key = parts[1];
+    if (!key.startsWith('products/')) return res.status(400).json({ error: 'Invalid image path.' });
     await s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_S3_BUCKET_NAME, Key: key }));
 
     res.json({ success: true });
@@ -136,7 +203,7 @@ app.get('/api/products', async (req, res) => {
     res.json(allProducts.rows);
   } catch (err) {
     console.error("Products GET Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -154,7 +221,7 @@ app.get('/api/products/:id', async (req, res) => {
     res.json(product.rows[0]);
   } catch (err) {
     console.error("Single Product GET Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -164,6 +231,7 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
     const {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      closure_type, length_type,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
@@ -171,11 +239,11 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
     const query = `
       INSERT INTO products (
         title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-        sku, hsn_code, fabric, pattern, neck_type, belt_included, 
+        sku, hsn_code, fabric, pattern, neck_type, belt_included, closure_type, length_type,
         manufacturer_details, care_instructions, origin_country,
         main_category, sub_category, item_type, category, variants, extra_categories, color_images
       ) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) 
       RETURNING *;
     `;
 
@@ -186,6 +254,7 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
       JSON.stringify(colors), 
       is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      closure_type || null, length_type || null,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, sub_category,
       JSON.stringify(variants),
@@ -197,7 +266,7 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
     res.json(newProduct.rows[0]);
   } catch (err) {
     console.error("Product POST Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -208,6 +277,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
     const {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      closure_type, length_type,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
@@ -216,11 +286,12 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       UPDATE products SET 
         title = $1, description = $2, price = $3, mrp = $4, image_urls = $5, sizes = $6, colors = $7, 
         is_featured = $8, is_new_arrival = $9, homepage_section = $10, homepage_card_slot = $11,
-        sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17, 
-        manufacturer_details = $18, care_instructions = $19, origin_country = $20,
-        main_category = $21, sub_category = $22, item_type = $23, category = $24, variants = $25,
-        extra_categories = $26, color_images = $27
-      WHERE id = $28 RETURNING *;
+        sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17,
+        closure_type = $18, length_type = $19,
+        manufacturer_details = $20, care_instructions = $21, origin_country = $22,
+        main_category = $23, sub_category = $24, item_type = $25, category = $26, variants = $27,
+        extra_categories = $28, color_images = $29
+      WHERE id = $30 RETURNING *;
     `;
 
     const values = [
@@ -230,6 +301,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       JSON.stringify(colors), 
       is_featured, is_new_arrival, homepage_section, homepage_card_slot,
       sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      closure_type || null, length_type || null,
       manufacturer_details, care_instructions, origin_country,
       main_category, sub_category, item_type, sub_category,
       JSON.stringify(variants),
@@ -242,7 +314,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
     res.json(updatedProduct.rows[0]);
   } catch (err) {
     console.error("Product PUT Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -254,7 +326,7 @@ app.delete("/api/products/:id", authenticateAdmin, async (req, res) => {
     res.json({ message: "Product removed from storefront" });
   } catch (err) {
     console.error("Delete Product Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -274,7 +346,7 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
 });
 
 // GET: Live stats for the Admin Overview Panel
-app.get("/api/admin/stats", async (req, res) => {
+app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
   try {
     const productCount = await pool.query("SELECT COUNT(*) FROM products");
     const orderCount = await pool.query("SELECT COUNT(*) FROM orders WHERE status != 'Delivered'");
@@ -287,7 +359,7 @@ app.get("/api/admin/stats", async (req, res) => {
     });
   } catch (err) {
     console.error("Admin Stats Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -297,11 +369,15 @@ app.get("/api/admin/stats", async (req, res) => {
 // ==========================================
 
 // POST: Create a new order + deduct stock
-app.post("/api/orders", async (req, res) => {
+app.post("/api/orders", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { cartItems, totalAmount, address, paymentMethod, userEmail, couponCode, discountAmount } = req.body;
+    const { cartItems, totalAmount, address, paymentMethod, couponCode, discountAmount } = req.body;
     const finalAmount = parseFloat(totalAmount) - (parseFloat(discountAmount) || 0);
+    // Always derive email from the verified JWT — never trust client-supplied email
+    const userRes = await client.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(401).json({ error: 'User not found' });
+    const userEmail = userRes.rows[0].email;
 
     await client.query('BEGIN');
 
@@ -346,17 +422,18 @@ app.post("/api/orders", async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error("Create Order Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   } finally {
     client.release();
   }
 });
 
 // Fetch orders specifically for the logged-in customer's profile
-app.get("/api/orders/user/:email", async (req, res) => {
+app.get("/api/orders/user/:email", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.params;
-    const result = await pool.query("SELECT * FROM orders WHERE user_email = $1 ORDER BY id DESC", [email]);
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const result = await pool.query("SELECT * FROM orders WHERE user_email = $1 ORDER BY id DESC", [userRes.rows[0].email]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -392,7 +469,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.json({ token, user: newUser.rows[0] });
   } catch (err) {
     console.error("Register Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -416,10 +493,95 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({ token, user: { id: user.rows[0].id, name: user.rows[0].name, email: user.rows[0].email } });
   } catch (err) {
     console.error("Login Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
+
+// ==========================================
+// OTP ROUTES
+// ==========================================
+
+// POST: Send OTP (login or reset)
+app.post('/api/auth/send-otp', async (req, res) => {
+  try {
+    const { email, purpose } = req.body;
+    if (!email || !purpose) return res.status(400).json({ error: 'Email and purpose are required.' });
+    if (!['login', 'reset'].includes(purpose)) return res.status(400).json({ error: 'Invalid purpose.' });
+
+    if (purpose === 'reset') {
+      const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+      if (userRes.rows.length === 0) return res.json({ success: true }); // silent — don't reveal
+    }
+
+    // Rate limit: max 3 OTPs per 10 minutes
+    const recentCount = await pool.query(
+      `SELECT COUNT(*) FROM otps WHERE identifier = $1 AND created_at > NOW() - INTERVAL '10 minutes'`,
+      [email]
+    );
+    if (parseInt(recentCount.rows[0].count) >= 3)
+      return res.status(429).json({ error: 'Too many requests. Please wait 10 minutes.' });
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expires = new Date(Date.now() + 10 * 60 * 1000);
+
+    await pool.query('UPDATE otps SET used = true WHERE identifier = $1 AND purpose = $2 AND used = false', [email, purpose]);
+    await pool.query('INSERT INTO otps (identifier, otp, purpose, expires_at) VALUES ($1, $2, $3, $4)', [email, otp, purpose, expires]);
+    await sendOtpEmail(email, otp, purpose);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Send OTP Error:', err.message);
+    res.status(500).json({ error: 'Failed to send OTP. Please try again.' });
+  }
+});
+
+// POST: Verify OTP
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, otp, purpose } = req.body;
+    if (!email || !otp || !purpose) return res.status(400).json({ error: 'All fields are required.' });
+
+    const result = await pool.query(
+      `SELECT * FROM otps WHERE identifier = $1 AND otp = $2 AND purpose = $3 AND used = false AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [email, otp, purpose]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired OTP.' });
+
+    await pool.query('UPDATE otps SET used = true WHERE id = $1', [result.rows[0].id]);
+
+    if (purpose === 'login') {
+      let userRes = await pool.query('SELECT id, name, email FROM users WHERE email = $1', [email]);
+      if (userRes.rows.length === 0) {
+        const name = email.split('@')[0];
+        userRes = await pool.query(
+          'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email',
+          [name, email, await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 10)]
+        );
+      }
+      const user = userRes.rows[0];
+      const token = jwt.sign({ user: { id: user.id } }, JWT_SECRET, { expiresIn: '10h' });
+      return res.json({ success: true, token, user });
+    }
+
+    if (purpose === 'reset') {
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const expires = new Date(Date.now() + 15 * 60 * 1000);
+      const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+      if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+      await pool.query(
+        `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
+        [userRes.rows[0].id, resetToken, expires]
+      );
+      return res.json({ success: true, resetToken });
+    }
+  } catch (err) {
+    console.error('Verify OTP Error:', err.message);
+    res.status(500).json({ error: 'Server Error' });
+  }
+});
 
 // POST: Forgot Password — generates a reset token
 app.post("/api/auth/forgot-password", async (req, res) => {
@@ -429,18 +591,18 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     // Always return success to prevent email enumeration
     if (userRes.rows.length === 0) return res.json({ success: true });
 
-    const token = require('crypto').randomBytes(32).toString('hex');
+    const token = crypto.randomBytes(32).toString('hex');
     const expires = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
     await pool.query(
       `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)
        ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
       [userRes.rows[0].id, token, expires]
     );
-    // In production wire this to AWS SES. For now return token in response (dev only).
-    res.json({ success: true, reset_token: token });
+    // In production wire this to AWS SES. Token is NOT returned in response.
+    res.json({ success: true });
   } catch (err) {
     console.error("Forgot Password Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -461,7 +623,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("Reset Password Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -481,7 +643,7 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
     res.json(userOrders.rows);
   } catch (err) {
     console.error("User Orders GET Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -513,7 +675,7 @@ app.get('/api/wishlist/check/:productId', authenticateToken, async (req, res) =>
     res.json({ isWishlisted: check.rows.length > 0 });
   } catch (err) {
     console.error("Wishlist Check Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -534,7 +696,7 @@ app.post('/api/wishlist/toggle', authenticateToken, async (req, res) => {
     }
   } catch (err) {
     console.error("Wishlist Toggle Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -553,7 +715,7 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error("Wishlist GET Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -578,7 +740,10 @@ app.post("/api/admin/login", async (req, res) => {
     if (dbAdmin.password.startsWith('$2b$') || dbAdmin.password.startsWith('$2a$')) {
       isValid = await bcrypt.compare(password, dbAdmin.password);
     } else {
-      isValid = (password === dbAdmin.password);
+      const { timingSafeEqual } = crypto;
+      const a = Buffer.from(password);
+      const b = Buffer.from(dbAdmin.password);
+      isValid = a.length === b.length && timingSafeEqual(a, b);
       // Auto-upgrade to bcrypt on first login
       if (isValid) {
         const hashed = await bcrypt.hash(password, 10);
@@ -594,7 +759,7 @@ app.post("/api/admin/login", async (req, res) => {
     }
   } catch (err) {
     console.error("Admin Login Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -610,7 +775,7 @@ app.get("/api/admin/orders", authenticateAdmin, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error("Admin Fetch Orders Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -625,7 +790,7 @@ app.put("/api/admin/orders/:id/status", authenticateAdmin, async (req, res) => {
     res.json({ success: true, order: result.rows[0] });
   } catch (err) {
     console.error("Admin Update Status Error:", err.message);
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -646,16 +811,18 @@ app.get('/api/reviews/check/:productId', authenticateToken, async (req, res) => 
     const email = userRes.rows[0].email;
 
     // Check if user has ordered this product
+    const pidCheck = parseInt(productId, 10);
+    if (!pidCheck) return res.json({ canReview: false });
     const orderRes = await pool.query(
       `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
-      [email, `%"id":${productId}%`]
+      [email, `%"id":${pidCheck}%`]
     );
     const hasBought = orderRes.rows.length > 0;
 
     // Check if already reviewed
     const reviewRes = await pool.query(
       'SELECT id FROM reviews WHERE user_id = $1 AND product_id = $2',
-      [userId, productId]
+      [userId, pidCheck]
     );
     const alreadyReviewed = reviewRes.rows.length > 0;
 
@@ -689,10 +856,12 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     const { name, email } = userRes.rows[0];
 
-    // Verify buyer
+    // Verify buyer — cast productId to int to prevent injection
+    const pid = parseInt(productId, 10);
+    if (!pid) return res.status(400).json({ error: 'Invalid product ID.' });
     const orderRes = await pool.query(
       `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
-      [email, `%"id":${productId}%`]
+      [email, `%"id":${pid}%`]
     );
     if (orderRes.rows.length === 0)
       return res.status(403).json({ error: 'Only verified buyers can review this product.' });
@@ -700,14 +869,16 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     // Prevent duplicate review
     const existing = await pool.query(
       'SELECT id FROM reviews WHERE user_id = $1 AND product_id = $2',
-      [userId, productId]
+      [userId, pid]
     );
     if (existing.rows.length > 0)
       return res.status(400).json({ error: 'You have already reviewed this product.' });
 
+    if (!Number.isInteger(parseInt(rating, 10)) || rating < 1 || rating > 5)
+      return res.status(400).json({ error: 'Rating must be between 1 and 5.' });
     const result = await pool.query(
       'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [productId, userId, name, rating, comment]
+      [pid, userId, name, parseInt(rating, 10), comment]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -895,6 +1066,83 @@ app.put('/api/admin/coupons/:id', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       'UPDATE coupons SET is_active = NOT is_active WHERE id = $1 RETURNING *',
       [req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// 12. RETURN REQUEST ROUTES
+// ==========================================
+
+// POST: Submit a return request (only for Delivered orders)
+app.post('/api/returns', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { order_id, order_number, reason, comments } = req.body;
+    if (!order_id || !reason) return res.status(400).json({ error: 'order_id and reason are required.' });
+
+    // Verify the order belongs to this user and is Delivered
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const orderRes = await pool.query(
+      "SELECT id FROM orders WHERE id = $1 AND user_email = $2 AND status = 'Delivered'",
+      [order_id, userRes.rows[0].email]
+    );
+    if (orderRes.rows.length === 0)
+      return res.status(400).json({ error: 'Only delivered orders can be returned.' });
+
+    // Prevent duplicate return request
+    const existing = await pool.query('SELECT id FROM returns WHERE order_id = $1 AND user_id = $2', [order_id, userId]);
+    if (existing.rows.length > 0)
+      return res.status(400).json({ error: 'A return request already exists for this order.' });
+
+    const result = await pool.query(
+      'INSERT INTO returns (order_id, order_number, user_id, reason, comments) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [order_id, order_number, userId, reason, comments || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Fetch all return requests for the logged-in user
+app.get('/api/returns', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM returns WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Admin — all return requests
+app.get('/api/admin/returns', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.*, u.name as user_name, u.email as user_email FROM returns r
+       JOIN users u ON r.user_id = u.id ORDER BY r.created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT: Admin — update return status
+app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const result = await pool.query(
+      'UPDATE returns SET status = $1 WHERE id = $2 RETURNING *',
+      [status, req.params.id]
     );
     res.json(result.rows[0]);
   } catch (err) {
