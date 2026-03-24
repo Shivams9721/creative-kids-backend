@@ -34,7 +34,7 @@ app.use(cookieParser());
 
 // CSRF double-submit cookie protection (csrf-csrf library)
 const CSRF_SECRET = process.env.CSRF_SECRET || crypto.randomBytes(32).toString('hex');
-const { generateToken, doubleCsrfProtection } = doubleCsrf({
+const { generateCsrfToken, doubleCsrfProtection } = doubleCsrf({
   getSecret: () => CSRF_SECRET,
   cookieName: 'x-csrf-token',
   cookieOptions: {
@@ -49,7 +49,7 @@ const { generateToken, doubleCsrfProtection } = doubleCsrf({
 // Expose CSRF token endpoint (called once on app load)
 // nocsrf
 app.get('/api/csrf-token', (req, res) => {
-  const token = generateToken(req, res);
+  const token = generateCsrfToken(req, res);
   res.json({ csrfToken: token });
 });
 
@@ -266,6 +266,16 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
     res.json(newProduct.rows[0]);
   } catch (err) {
     console.error("Product POST Error:", err.message);
+    res.status(500).json({ error: "Server Error" });
+  }
+});
+
+// PUT: Restore a soft-deleted product
+app.put("/api/products/:id/restore", authenticateAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE products SET is_active = true WHERE id = $1", [req.params.id]);
+    res.json({ message: "Product restored" });
+  } catch (err) {
     res.status(500).json({ error: "Server Error" });
   }
 });
