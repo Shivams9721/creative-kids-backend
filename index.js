@@ -38,8 +38,8 @@ const { generateCsrfToken, doubleCsrfProtection } = doubleCsrf({
   getSecret: () => CSRF_SECRET,
   cookieName: 'x-csrf-token',
   cookieOptions: {
-    sameSite: 'strict',
-    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'none',
+    secure: true,
     httpOnly: true,
   },
   size: 64,
