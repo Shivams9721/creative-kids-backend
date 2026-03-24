@@ -210,7 +210,8 @@ app.get('/api/products', async (req, res) => {
 // GET: Single Product by ID
 app.get('/api/products/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(404).json({ message: "Product not found" });
     const query = `SELECT * FROM products WHERE id = $1;`;
     const product = await pool.query(query, [id]);
 
