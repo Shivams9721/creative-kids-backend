@@ -3,7 +3,6 @@ const cors = require('cors');
 const crypto = require('crypto');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
-const { doubleCsrf } = require('csrf-csrf');
 const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -32,30 +31,8 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
-// CSRF double-submit cookie protection (csrf-csrf library)
-const CSRF_SECRET = process.env.CSRF_SECRET || crypto.randomBytes(32).toString('hex');
-const { generateCsrfToken, doubleCsrfProtection } = doubleCsrf({
-  getSecret: () => CSRF_SECRET,
-  getSessionIdentifier: (req) => req.ip || 'session',
-  cookieName: 'x-csrf-token',
-  cookieOptions: {
-    sameSite: 'none',
-    secure: true,
-    httpOnly: true,
-  },
-  size: 64,
-  getTokenFromRequest: (req) => req.headers['x-csrf-token'],
-});
-
-// Expose CSRF token endpoint (called once on app load)
-// nocsrf
-app.get('/api/csrf-token', (req, res) => {
-  const token = generateCsrfToken(req, res);
-  res.json({ csrfToken: token });
-});
-
-// Apply CSRF double-submit cookie protection to all mutating routes
-app.use(doubleCsrfProtection);
+// CSRF token stub — kept for frontend compatibility
+app.get('/api/csrf-token', (req, res) => res.json({ csrfToken: 'none' }));
 
 // ==========================================
 // EMAIL (AWS SES via SMTP)
