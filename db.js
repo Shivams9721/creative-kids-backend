@@ -9,7 +9,7 @@ connectionString = connectionString.replace("?sslmode=require", "");
 const pool = new Pool({
     connectionString: connectionString,
     ssl: {
-        rejectUnauthorized: true
+        rejectUnauthorized: false
     },
     
     // --- SECURITY & PERFORMANCE SAFEGUARDS ---
