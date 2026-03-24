@@ -36,6 +36,7 @@ app.use(cookieParser());
 const CSRF_SECRET = process.env.CSRF_SECRET || crypto.randomBytes(32).toString('hex');
 const { generateCsrfToken, doubleCsrfProtection } = doubleCsrf({
   getSecret: () => CSRF_SECRET,
+  getSessionIdentifier: (req) => req.ip || 'session',
   cookieName: 'x-csrf-token',
   cookieOptions: {
     sameSite: 'none',
