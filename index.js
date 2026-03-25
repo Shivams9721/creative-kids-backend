@@ -1067,7 +1067,44 @@ app.put('/api/admin/coupons/:id', authenticateAdmin, async (req, res) => {
 
 
 // ==========================================
-// 12. RETURN REQUEST ROUTES
+// 12. STOCK NOTIFICATION ROUTES
+// ==========================================
+
+// POST: Save notify-me email for an out-of-stock product
+app.post('/api/notify-me', async (req, res) => {
+  try {
+    const { email, product_id } = req.body;
+    if (!email || !product_id) return res.status(400).json({ error: 'email and product_id are required.' });
+    // Upsert — ignore duplicate (same email + product)
+    await pool.query(
+      `INSERT INTO stock_notifications (email, product_id) VALUES ($1, $2)
+       ON CONFLICT (email, product_id) DO NOTHING`,
+      [email, parseInt(product_id, 10)]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Admin — all pending stock notifications
+app.get('/api/admin/stock-notifications', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sn.id, sn.email, sn.product_id, sn.created_at, p.title as product_title
+       FROM stock_notifications sn
+       JOIN products p ON p.id = sn.product_id
+       ORDER BY sn.created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// 13. RETURN REQUEST ROUTES
 // ==========================================
 
 // POST: Submit a return request (only for Delivered orders)
