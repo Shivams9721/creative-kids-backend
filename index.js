@@ -1184,6 +1184,19 @@ app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Creative Kids backend is running securely on port ${PORT}`);
+  // Auto-create tables if they don't exist
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS stock_notifications (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      product_id INTEGER NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(email, product_id)
+    )`);
+    console.log('stock_notifications table ready');
+  } catch (e) {
+    console.error('Table init error:', e.message);
+  }
 });
