@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const fs = require('fs');
 require('dotenv').config();
 
 // 1. Safely grab the URL from AWS
@@ -9,7 +10,8 @@ connectionString = connectionString.replace("?sslmode=require", "");
 const pool = new Pool({
     connectionString: connectionString,
     ssl: {
-        rejectUnauthorized: false
+        rejectUnauthorized: true,
+        ca: fs.readFileSync('./certs/global-bundle.pem').toString(),
     },
     
     // --- SECURITY & PERFORMANCE SAFEGUARDS ---

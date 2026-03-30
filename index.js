@@ -174,10 +174,27 @@ app.post('/api/upload', authenticateAdmin, upload.single('image'), async (req, r
 // 1. PRODUCT ROUTES
 // ==========================================
 
-// GET: All Products (only active ones for storefront)
+// GET: All Products (only active, published ones for storefront)
 app.get('/api/products', async (req, res) => {
   try {
-    const allProducts = await pool.query(`SELECT * FROM products WHERE is_active = true ORDER BY id DESC;`);
+    const { sub_category, main_category, new_arrival } = req.query;
+    let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
+    const values = [];
+    if (main_category) {
+      values.push(main_category);
+      query += ` AND main_category = $${values.length}`;
+    }
+    if (sub_category) {
+      values.push(sub_category);
+      query += ` AND sub_category = $${values.length}`;
+    }
+    if (new_arrival === 'true') {
+      query += ` AND is_new_arrival = true`;
+    }
+    query += ` ORDER BY id DESC`;
+    if (sub_category || main_category || new_arrival) query += ` LIMIT 120`;
+    query += `;`;
+    const allProducts = await pool.query(query, values);
     res.json(allProducts.rows);
   } catch (err) {
     console.error("Products GET Error:", err.message);
@@ -189,6 +206,7 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ message: "Invalid product ID" });
     if (!id) return res.status(404).json({ message: "Product not found" });
     const query = `SELECT * FROM products WHERE id = $1;`;
     const product = await pool.query(query, [id]);
@@ -215,14 +233,16 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
       main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
 
+    const { is_draft } = req.body;
+
     const query = `
       INSERT INTO products (
         title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
         sku, hsn_code, fabric, pattern, neck_type, belt_included, closure_type, length_type,
         manufacturer_details, care_instructions, origin_country,
-        main_category, sub_category, item_type, category, variants, extra_categories, color_images
+        main_category, sub_category, item_type, category, variants, extra_categories, color_images, is_draft
       ) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) 
       RETURNING *;
     `;
 
@@ -238,7 +258,8 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
       main_category, sub_category, item_type, sub_category,
       JSON.stringify(variants),
       JSON.stringify(extra_categories || []),
-      JSON.stringify(color_images || {})
+      JSON.stringify(color_images || {}),
+      is_draft || false
     ];
 
     const newProduct = await pool.query(query, values);
@@ -271,6 +292,8 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       main_category, sub_category, item_type, variants, extra_categories, color_images
     } = req.body;
 
+    const { is_draft } = req.body;
+
     const query = `
       UPDATE products SET 
         title = $1, description = $2, price = $3, mrp = $4, image_urls = $5, sizes = $6, colors = $7, 
@@ -279,8 +302,8 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
         closure_type = $18, length_type = $19,
         manufacturer_details = $20, care_instructions = $21, origin_country = $22,
         main_category = $23, sub_category = $24, item_type = $25, category = $26, variants = $27,
-        extra_categories = $28, color_images = $29
-      WHERE id = $30 RETURNING *;
+        extra_categories = $28, color_images = $29, is_draft = $30
+      WHERE id = $31 RETURNING *;
     `;
 
     const values = [
@@ -296,6 +319,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
       JSON.stringify(variants),
       JSON.stringify(extra_categories || []),
       JSON.stringify(color_images || {}),
+      is_draft || false,
       id
     ];
 
@@ -364,8 +388,7 @@ app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
 app.post("/api/orders", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { cartItems, totalAmount, address, paymentMethod, couponCode, discountAmount } = req.body;
-    const finalAmount = parseFloat(totalAmount) - (parseFloat(discountAmount) || 0);
+    const { cartItems, address, paymentMethod, couponCode, discountAmount } = req.body;
     // Always derive email from the verified JWT — never trust client-supplied email
     const userRes = await client.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
     if (userRes.rows.length === 0) return res.status(401).json({ error: 'User not found' });
@@ -373,34 +396,47 @@ app.post("/api/orders", authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // 1. Deduct stock for each cart item
+    // 1. Re-fetch prices from DB and deduct stock — never trust client-supplied prices
+    let serverTotal = 0;
+    const enrichedItems = [];
     for (const item of cartItems) {
-      const productRes = await client.query("SELECT variants FROM products WHERE id = $1", [item.id]);
-      if (productRes.rows.length > 0) {
-        let variants = [];
-        try { variants = typeof productRes.rows[0].variants === 'string' ? JSON.parse(productRes.rows[0].variants) : (productRes.rows[0].variants || []); } catch(e) {}
-
-        const itemColor = item.selectedColor || item.color || 'Default';
-        const itemSize = item.selectedSize || item.size || 'Default';
-        const updated = variants.map(v => {
-          const colorMatch = v.color === itemColor || (itemColor === 'Default' && v.color === 'Default');
-          const sizeMatch = v.size === itemSize || (itemSize === 'Default' && v.size === 'Default');
-          if (colorMatch && sizeMatch) {
-            return { ...v, stock: Math.max(0, v.stock - (item.quantity || 1)) };
-          }
-          return v;
-        });
-        await client.query("UPDATE products SET variants = $1 WHERE id = $2", [JSON.stringify(updated), item.id]);
+      const productRes = await client.query("SELECT price, title, variants FROM products WHERE id = $1 AND is_active = true", [item.id]);
+      if (productRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Product ${item.id} is no longer available.` });
       }
+      const product = productRes.rows[0];
+      const qty = parseInt(item.quantity) || 1;
+      serverTotal += parseFloat(product.price) * qty;
+
+      let variants = [];
+      try { variants = typeof product.variants === 'string' ? JSON.parse(product.variants) : (product.variants || []); } catch(e) {}
+
+      const itemColor = item.selectedColor || item.color || 'Default';
+      const itemSize = item.selectedSize || item.size || 'Default';
+      const updated = variants.map(v => {
+        const colorMatch = v.color === itemColor || (itemColor === 'Default' && v.color === 'Default');
+        const sizeMatch = v.size === itemSize || (itemSize === 'Default' && v.size === 'Default');
+        if (colorMatch && sizeMatch) {
+          return { ...v, stock: Math.max(0, v.stock - qty) };
+        }
+        return v;
+      });
+      await client.query("UPDATE products SET variants = $1 WHERE id = $2", [JSON.stringify(updated), item.id]);
+
+      enrichedItems.push({ ...item, price: parseFloat(product.price), title: product.title });
     }
+
+    const discountAmt = parseFloat(discountAmount) || 0;
+    const finalAmount = Math.max(0, serverTotal - discountAmt);
 
     // 2. Insert the order
     const result = await client.query(
       `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email, coupon_code, discount_amount)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id;`,
-      [address.fullName, address.phone, finalAmount, cartItems.length, 'Processing',
-       JSON.stringify(address), JSON.stringify(cartItems), paymentMethod, userEmail || 'guest',
-       couponCode || null, discountAmount || 0]
+      [address.fullName, address.phone, finalAmount, enrichedItems.length, 'Processing',
+       JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail,
+       couponCode || null, discountAmt]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
@@ -514,7 +550,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
     if (parseInt(recentCount.rows[0].count) >= 3)
       return res.status(429).json({ error: 'Too many requests. Please wait 10 minutes.' });
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = String(crypto.randomInt(100000, 1000000));
     const expires = new Date(Date.now() + 10 * 60 * 1000);
 
     await pool.query('UPDATE otps SET used = true WHERE identifier = $1 AND purpose = $2 AND used = false', [email, purpose]);
@@ -627,10 +663,11 @@ app.post("/api/auth/reset-password", async (req, res) => {
 // GET: Fetch ONLY the logged-in user's orders
 app.get('/api/user/orders', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     const userOrders = await pool.query(
-      "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC",
-      [userId]
+      "SELECT * FROM orders WHERE user_email = $1 ORDER BY created_at DESC",
+      [userRes.rows[0].email]
     );
     res.json(userOrders.rows);
   } catch (err) {
@@ -727,21 +764,8 @@ app.post("/api/admin/login", async (req, res) => {
     }
 
     const dbAdmin = adminCheck.rows[0];
-    // Support both bcrypt hashed and plain-text passwords (migration safe)
-    let isValid = false;
-    if (dbAdmin.password.startsWith('$2b$') || dbAdmin.password.startsWith('$2a$')) {
-      isValid = await bcrypt.compare(password, dbAdmin.password);
-    } else {
-      const { timingSafeEqual } = crypto;
-      const a = Buffer.from(password);
-      const b = Buffer.from(dbAdmin.password);
-      isValid = a.length === b.length && timingSafeEqual(a, b);
-      // Auto-upgrade to bcrypt on first login
-      if (isValid) {
-        const hashed = await bcrypt.hash(password, 10);
-        await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashed, dbAdmin.id]);
-      }
-    }
+    // Enforce bcrypt comparison for all passwords
+    const isValid = await bcrypt.compare(password, dbAdmin.password);
 
     if (isValid) {
       const token = jwt.sign({ role: "admin", id: dbAdmin.id }, JWT_SECRET, { expiresIn: "12h" });
@@ -806,8 +830,8 @@ app.get('/api/reviews/check/:productId', authenticateToken, async (req, res) => 
     const pidCheck = parseInt(productId, 10);
     if (!pidCheck) return res.json({ canReview: false });
     const orderRes = await pool.query(
-      `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
-      [email, `%"id":${pidCheck}%`]
+      `SELECT id FROM orders WHERE user_email = $1 AND status = 'Delivered' AND items @> jsonb_build_array(jsonb_build_object('id', $2::integer))`,
+      [email, pidCheck]
     );
     const hasBought = orderRes.rows.length > 0;
 
@@ -852,8 +876,8 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     const pid = parseInt(productId, 10);
     if (!pid) return res.status(400).json({ error: 'Invalid product ID.' });
     const orderRes = await pool.query(
-      `SELECT id FROM orders WHERE user_email = $1 AND items::text LIKE $2 AND status = 'Delivered'`,
-      [email, `%"id":${pid}%`]
+      `SELECT id FROM orders WHERE user_email = $1 AND status = 'Delivered' AND items @> jsonb_build_array(jsonb_build_object('id', $2::integer))`,
+      [email, pid]
     );
     if (orderRes.rows.length === 0)
       return res.status(403).json({ error: 'Only verified buyers can review this product.' });
@@ -907,7 +931,7 @@ app.get('/api/admin/analytics/top-products', authenticateAdmin, async (req, res)
         COUNT(DISTINCT o.id) as order_count,
         SUM(o.total_amount) as total_revenue
       FROM products p
-      JOIN orders o ON o.items::text LIKE '%"id":' || p.id || '%'
+      JOIN orders o ON o.items::jsonb @> jsonb_build_array(jsonb_build_object('id', p.id))
       WHERE o.status != 'Cancelled'
       GROUP BY p.id
       ORDER BY order_count DESC
