@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { doubleCsrf } = require('csrf-csrf');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 const pool = require('./db');
@@ -9,12 +10,29 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const nodemailer = require('nodemailer');
+const Razorpay = require('razorpay');
 require('dotenv').config();
 
 const app = express();
 
 // Security headers via helmet (all protections enabled)
 app.use(helmet());
+
+// CSRF Protection Setup
+const {
+  invalidCsrfTokenError, // Error if the token is invalid
+  generateToken, // Use to generate token
+  validateRequest, // The middleware to validate a request
+  doubleCsrfProtection, // The middleware to apply to all routes
+} = doubleCsrf({
+  getSecret: () => process.env.CSRF_SECRET, // A secret that's loaded from .env
+  cookieName: "__host-psifi.x-csrf-token",
+  cookieOptions: {
+    sameSite: "lax",
+    path: "/",
+    secure: process.env.NODE_ENV === 'production',
+  },
+});
 
 // Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
@@ -31,8 +49,11 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
-// CSRF token stub — kept for frontend compatibility
-app.get('/api/csrf-token', (req, res) => res.json({ csrfToken: 'none' }));
+// Generate and send CSRF token to the frontend
+app.get('/api/csrf-token', (req, res) => {
+  const csrfToken = generateToken(req, res);
+  res.json({ csrfToken });
+});
 
 // ==========================================
 // EMAIL (AWS SES via SMTP)
@@ -67,6 +88,18 @@ const sendOtpEmail = async (toEmail, otp, purpose) => {
 // JWT Secret Key (Used for keeping users logged in safely)
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is not set');
+
+// ==========================================
+// RAZORPAY SETUP
+// ==========================================
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
+});
+
+if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+  console.warn('⚠️  Razorpay credentials not configured. Online payments will not work.');
+}
 
 
 // ==========================================
@@ -106,6 +139,40 @@ const authenticateAdmin = (req, res, next) => {
 // AWS S3 IMAGE UPLOAD SETUP
 // ==========================================
 
+// Helper: Validate product data
+const validateProductData = (data, isDraft) => {
+  if (isDraft) return null; // Skip validation for drafts
+  
+  if (!data.title || !data.title.trim()) return 'Product title is required';
+  if (!data.price || parseFloat(data.price) <= 0) return 'Valid selling price is required';
+  if (!data.mrp || parseFloat(data.mrp) <= 0) return 'Valid MRP is required';
+  if (parseFloat(data.price) > parseFloat(data.mrp)) return 'Selling price cannot exceed MRP';
+  if (!data.main_category) return 'Main category is required';
+  if (!data.sub_category) return 'Sub category is required';
+  if (!data.item_type) return 'Item type is required';
+  if (!data.image_urls || data.image_urls.length === 0) return 'At least one image is required';
+  if (!data.sizes || data.sizes.length === 0) return 'At least one size is required';
+  if (!data.colors || data.colors.length === 0) return 'At least one color is required';
+  
+  // Validate image URLs are from S3
+  const s3Pattern = new RegExp(`^https://${process.env.AWS_S3_BUCKET_NAME}\\.s3\\.${process.env.AWS_REGION}\\.amazonaws\\.com/products/`);
+  for (const url of data.image_urls) {
+    if (!s3Pattern.test(url)) {
+      return 'Invalid image URL detected. Images must be uploaded through the system.';
+    }
+  }
+  
+  // Validate homepage card slot
+  if (data.homepage_card_slot !== null && data.homepage_card_slot !== undefined) {
+    const slot = parseInt(data.homepage_card_slot);
+    if (isNaN(slot) || slot < 1 || slot > 8) {
+      return 'Homepage card slot must be between 1 and 8';
+    }
+  }
+  
+  return null;
+};
+
 // 1. Configure AWS S3 Client
 const s3 = new S3Client({
   region: process.env.AWS_REGION,
@@ -119,7 +186,7 @@ const s3 = new S3Client({
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 // 3. Delete a single image from S3
-app.delete('/api/upload', authenticateAdmin, async (req, res) => {
+app.delete('/api/upload', authenticateAdmin, validateRequest, async (req, res) => {
   try {
     const { imageUrl } = req.body;
     if (!imageUrl) return res.status(400).json({ error: "No imageUrl provided." });
@@ -139,7 +206,7 @@ app.delete('/api/upload', authenticateAdmin, async (req, res) => {
 });
 
 // 4. The Upload API Route
-app.post('/api/upload', authenticateAdmin, upload.single('image'), async (req, res) => {
+app.post('/api/upload', authenticateAdmin, validateRequest, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No image file provided." });
@@ -223,7 +290,7 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // POST: Add new product
-app.post("/api/products", authenticateAdmin, async (req, res) => {
+app.post("/api/products", authenticateAdmin, validateRequest, async (req, res) => {
   try {
     const {
       title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
@@ -234,6 +301,12 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
     } = req.body;
 
     const { is_draft } = req.body;
+
+    // Validate product data
+    const validationError = validateProductData(req.body, is_draft);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
 
     const query = `
       INSERT INTO products (
@@ -271,7 +344,7 @@ app.post("/api/products", authenticateAdmin, async (req, res) => {
 });
 
 // PUT: Restore a soft-deleted product
-app.put("/api/products/:id/restore", authenticateAdmin, async (req, res) => {
+app.put("/api/products/:id/restore", authenticateAdmin, validateRequest, async (req, res) => {
   try {
     await pool.query("UPDATE products SET is_active = true WHERE id = $1", [req.params.id]);
     res.json({ message: "Product restored" });
@@ -281,7 +354,7 @@ app.put("/api/products/:id/restore", authenticateAdmin, async (req, res) => {
 });
 
 // PUT: Update an existing product
-app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
+app.put("/api/products/:id", authenticateAdmin, validateRequest, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -293,6 +366,12 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
     } = req.body;
 
     const { is_draft } = req.body;
+
+    // Validate product data
+    const validationError = validateProductData(req.body, is_draft);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
 
     const query = `
       UPDATE products SET 
@@ -332,7 +411,7 @@ app.put("/api/products/:id", authenticateAdmin, async (req, res) => {
 });
 
 // DELETE: Soft delete — requires explicit { confirm: "DELETE" } in body as a safety guard
-app.delete("/api/products/:id", authenticateAdmin, async (req, res) => {
+app.delete("/api/products/:id", authenticateAdmin, validateRequest, async (req, res) => {
   try {
     if (req.body?.confirm !== "DELETE") {
       return res.status(400).json({ error: "Missing confirmation. Send { confirm: 'DELETE' } to proceed." });
@@ -385,7 +464,7 @@ app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
 // ==========================================
 
 // POST: Create a new order + deduct stock
-app.post("/api/orders", authenticateToken, async (req, res) => {
+app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => {
   const client = await pool.connect();
   try {
     const { cartItems, address, paymentMethod, couponCode, discountAmount } = req.body;
@@ -474,7 +553,7 @@ app.get("/api/orders/user/:email", authenticateToken, async (req, res) => {
 // ==========================================
 
 // Register a New User
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", validateRequest, async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
@@ -502,7 +581,7 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // Login an Existing User
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", validateRequest, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -1203,6 +1282,127 @@ app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==========================================
+// 14. RAZORPAY PAYMENT ROUTES
+// ==========================================
+
+// POST: Create Razorpay Order
+app.post('/api/payment/create-order', authenticateToken, validateRequest, async (req, res) => {
+  try {
+    const { amount, currency = 'INR', receipt } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
+    // Create Razorpay order
+    const options = {
+      amount: Math.round(amount * 100), // Convert to paise
+      currency,
+      receipt: receipt || `order_${Date.now()}`,
+      payment_capture: 1 // Auto capture
+    };
+
+    const order = await razorpay.orders.create(options);
+    
+    res.json({
+      success: true,
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key_id: process.env.RAZORPAY_KEY_ID
+    });
+  } catch (err) {
+    console.error('Razorpay Order Creation Error:', err);
+    res.status(500).json({ error: 'Failed to create payment order' });
+  }
+});
+
+// POST: Verify Razorpay Payment Signature
+app.post('/api/payment/verify', authenticateToken, validateRequest, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing payment details' });
+    }
+
+    // Verify signature
+    const sign = razorpay_order_id + '|' + razorpay_payment_id;
+    const expectedSign = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(sign.toString())
+      .digest('hex');
+
+    if (razorpay_signature === expectedSign) {
+      // Fetch payment details from Razorpay
+      const payment = await razorpay.payments.fetch(razorpay_payment_id);
+      
+      res.json({
+        success: true,
+        verified: true,
+        payment_id: razorpay_payment_id,
+        order_id: razorpay_order_id,
+        amount: payment.amount / 100, // Convert from paise
+        status: payment.status,
+        method: payment.method
+      });
+    } else {
+      res.status(400).json({ error: 'Invalid payment signature', verified: false });
+    }
+  } catch (err) {
+    console.error('Payment Verification Error:', err);
+    res.status(500).json({ error: 'Payment verification failed' });
+  }
+});
+
+// POST: Get Payment Status
+app.post('/api/payment/status', authenticateToken, async (req, res) => {
+  try {
+    const { payment_id } = req.body;
+    
+    if (!payment_id) {
+      return res.status(400).json({ error: 'Payment ID required' });
+    }
+
+    const payment = await razorpay.payments.fetch(payment_id);
+    
+    res.json({
+      success: true,
+      payment_id: payment.id,
+      order_id: payment.order_id,
+      amount: payment.amount / 100,
+      status: payment.status,
+      method: payment.method,
+      captured: payment.captured,
+      created_at: payment.created_at
+    });
+  } catch (err) {
+    console.error('Payment Status Error:', err);
+    res.status(500).json({ error: 'Failed to fetch payment status' });
+  }
+});
+
+// ==========================================
+// GLOBAL ERROR HANDLER
+// ==========================================
+app.use((err, req, res, next) => {
+  if (err === invalidCsrfTokenError) {
+    res.status(403).json({ error: "Invalid CSRF token" });
+  } else if (err) {
+    // Log the full error for your own debugging
+    console.error("UNHANDLED_ERROR:", err.stack || err);
+
+    // Send a generic, safe error message to the client in production
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(500).json({ error: 'An internal server error occurred.' });
+    }
+    // In development, you might want to send the stack trace
+    res.status(500).json({ error: 'An internal server error occurred.', details: err.message });
+  } else {
+    next(err);
+  }
+});
 
 // ==========================================
 // START SERVER
