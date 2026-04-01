@@ -92,12 +92,15 @@ if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is not set');
 // ==========================================
 // RAZORPAY SETUP
 // ==========================================
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+let razorpay = null;
 
-if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+  });
+  console.log('✓ Razorpay initialized');
+} else {
   console.warn('⚠️  Razorpay credentials not configured. Online payments will not work.');
 }
 
@@ -425,6 +428,29 @@ app.delete("/api/products/:id", authenticateAdmin, validateRequest, async (req, 
   }
 });
 
+
+// GET: Homepage data (new arrivals, bestsellers, featured)
+app.get('/api/homepage', async (req, res) => {
+  try {
+    const newArrivals = await pool.query(
+      `SELECT * FROM products WHERE is_active = true AND is_new_arrival = true AND (is_draft = false OR is_draft IS NULL) ORDER BY created_at DESC LIMIT 4`
+    );
+    const bestsellers = await pool.query(
+      `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL) ORDER BY id DESC LIMIT 4`
+    );
+    const featured = await pool.query(
+      `SELECT * FROM products WHERE is_active = true AND is_featured = true AND (is_draft = false OR is_draft IS NULL) ORDER BY id DESC LIMIT 8`
+    );
+    res.json({
+      newArrivals: newArrivals.rows,
+      bestsellers: bestsellers.rows,
+      featured: featured.rows
+    });
+  } catch (err) {
+    console.error('Homepage GET Error:', err.message);
+    res.status(500).json({ error: 'Server Error' });
+  }
+});
 
 // ==========================================
 // 2. ADMIN DASHBOARD ROUTES
@@ -1288,6 +1314,7 @@ app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
 
 // POST: Create Razorpay Order
 app.post('/api/payment/create-order', authenticateToken, validateRequest, async (req, res) => {
+  if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
   try {
     const { amount, currency = 'INR', receipt } = req.body;
     
@@ -1320,6 +1347,7 @@ app.post('/api/payment/create-order', authenticateToken, validateRequest, async 
 
 // POST: Verify Razorpay Payment Signature
 app.post('/api/payment/verify', authenticateToken, validateRequest, async (req, res) => {
+  if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
@@ -1358,6 +1386,7 @@ app.post('/api/payment/verify', authenticateToken, validateRequest, async (req, 
 
 // POST: Get Payment Status
 app.post('/api/payment/status', authenticateToken, async (req, res) => {
+  if (!razorpay) return res.status(503).json({ error: 'Payment gateway not configured' });
   try {
     const { payment_id } = req.body;
     
