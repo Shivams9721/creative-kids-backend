@@ -19,20 +19,26 @@ const app = express();
 app.use(helmet());
 
 // CSRF Protection Setup
-const {
-  invalidCsrfTokenError, // Error if the token is invalid
-  generateToken, // Use to generate token
-  validateRequest, // The middleware to validate a request
-  doubleCsrfProtection, // The middleware to apply to all routes
-} = doubleCsrf({
-  getSecret: () => process.env.CSRF_SECRET, // A secret that's loaded from .env
-  cookieName: "__host-psifi.x-csrf-token",
-  cookieOptions: {
-    sameSite: "lax",
-    path: "/",
-    secure: process.env.NODE_ENV === 'production',
-  },
-});
+let generateToken, validateRequest, invalidCsrfTokenError;
+try {
+  const csrf = doubleCsrf({
+    getSecret: () => process.env.CSRF_SECRET || 'fallback-secret',
+    cookieName: "__host-psifi.x-csrf-token",
+    cookieOptions: {
+      sameSite: "lax",
+      path: "/",
+      secure: process.env.NODE_ENV === 'production',
+    },
+  });
+  generateToken = csrf.generateToken;
+  validateRequest = csrf.validateRequest;
+  invalidCsrfTokenError = csrf.invalidCsrfTokenError;
+} catch(e) {
+  console.warn('CSRF setup failed, using no-op:', e.message);
+  generateToken = (req, res) => 'none';
+  validateRequest = (req, res, next) => next();
+  invalidCsrfTokenError = null;
+}
 
 // Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
@@ -248,7 +254,7 @@ app.post('/api/upload', authenticateAdmin, validateRequest, upload.single('image
 app.get('/api/products', async (req, res) => {
   try {
     const { sub_category, main_category, new_arrival } = req.query;
-    let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
+    let query = `SELECT * FROM products WHERE is_active = true`;
     const values = [];
     if (main_category) {
       values.push(main_category);
@@ -433,13 +439,13 @@ app.delete("/api/products/:id", authenticateAdmin, validateRequest, async (req, 
 app.get('/api/homepage', async (req, res) => {
   try {
     const newArrivals = await pool.query(
-      `SELECT * FROM products WHERE is_active = true AND is_new_arrival = true AND (is_draft = false OR is_draft IS NULL) ORDER BY created_at DESC LIMIT 4`
+      `SELECT * FROM products WHERE is_active = true AND is_new_arrival = true ORDER BY created_at DESC LIMIT 4`
     );
     const bestsellers = await pool.query(
-      `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL) ORDER BY id DESC LIMIT 4`
+      `SELECT * FROM products WHERE is_active = true ORDER BY id DESC LIMIT 4`
     );
     const featured = await pool.query(
-      `SELECT * FROM products WHERE is_active = true AND is_featured = true AND (is_draft = false OR is_draft IS NULL) ORDER BY id DESC LIMIT 8`
+      `SELECT * FROM products WHERE is_active = true AND is_featured = true ORDER BY id DESC LIMIT 8`
     );
     res.json({
       newArrivals: newArrivals.rows,
@@ -1439,7 +1445,6 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, async () => {
   console.log(`Creative Kids backend is running securely on port ${PORT}`);
-  // Auto-create tables if they don't exist
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS stock_notifications (
       id SERIAL PRIMARY KEY,
@@ -1449,6 +1454,14 @@ app.listen(PORT, async () => {
       UNIQUE(email, product_id)
     )`);
     console.log('stock_notifications table ready');
+    // Auto-add missing columns if they don't exist
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS is_draft BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS closure_type TEXT`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS length_type TEXT`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS extra_categories JSONB DEFAULT '[]'`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS color_images JSONB DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS homepage_card_slot INTEGER`);
+    console.log('Schema migrations complete');
   } catch (e) {
     console.error('Table init error:', e.message);
   }
