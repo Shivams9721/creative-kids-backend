@@ -126,7 +126,8 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
   });
   console.log('✓ Razorpay initialized');
 } else {
-  console.warn('⚠️  Razorpay credentials not configured. Online payments will not work.');
+  console.warn('⚠️  Razorpay not configured. KEY_ID present:', !!process.env.RAZORPAY_KEY_ID, 'SECRET present:', !!process.env.RAZORPAY_KEY_SECRET);
+  console.warn('All env keys:', Object.keys(process.env).filter(k => k.includes('RAZOR') || k.includes('JWT') || k.includes('DATABASE')));
 }
 
 
