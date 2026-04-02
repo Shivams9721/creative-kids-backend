@@ -572,17 +572,18 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
 
     // 3. Insert the order
     const result = await client.query(
-      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email, coupon_code, discount_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id;`,
+      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;`,
       [address.fullName, address.phone, finalAmount, enrichedItems.length, 'Processing',
-       JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail,
-       couponCode || null, serverDiscount]
+       JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
     await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
+    // Update coupon/discount if applicable (columns may not exist on older schemas)
     if (couponCode && serverDiscount > 0) {
-      await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]);
+      await client.query(`UPDATE orders SET coupon_code = $1, discount_amount = $2 WHERE id = $3`, [couponCode, serverDiscount, newId]).catch(() => {});
+      await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]).catch(() => {});
     }
 
     await client.query('COMMIT');
@@ -1480,6 +1481,13 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS extra_categories JSONB DEFAULT '[]'`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS color_images JSONB DEFAULT '{}'`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS homepage_card_slot INTEGER`);
+    // Orders table columns
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC DEFAULT 0`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_name TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS awb_number TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT`);
     console.log('Schema migrations complete');
   } catch (e) {
     console.error('Table init error:', e.message);
