@@ -23,6 +23,7 @@ let generateCsrfToken, validateRequest, invalidCsrfTokenError;
 try {
   const csrf = doubleCsrf({
     getSecret: () => process.env.CSRF_SECRET || 'fallback-secret',
+    getSessionIdentifier: (req) => req.ip || req.headers['x-forwarded-for'] || '',
     cookieName: "__host-psifi.x-csrf-token",
     cookieOptions: {
       sameSite: "lax",
