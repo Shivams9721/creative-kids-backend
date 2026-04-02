@@ -15,6 +15,9 @@ require('dotenv').config();
 
 const app = express();
 
+// Trust App Runner / ALB proxy
+app.set('trust proxy', 1);
+
 // Security headers via helmet (all protections enabled)
 app.use(helmet());
 
@@ -570,17 +573,16 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
     }
     const finalAmount = Math.max(0, serverTotal - serverDiscount);
 
-    // 3. Insert the order
+    // 3. Insert the order — use only columns guaranteed to exist
     const result = await client.query(
-      `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;`,
-      [address.fullName, address.phone, finalAmount, enrichedItems.length, 'Processing',
+      `INSERT INTO orders (phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id;`,
+      [address.phone, finalAmount, enrichedItems.length, 'Processing',
        JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
-    await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
-    // Update coupon/discount if applicable (columns may not exist on older schemas)
+    await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]).catch(() => {});
     if (couponCode && serverDiscount > 0) {
       await client.query(`UPDATE orders SET coupon_code = $1, discount_amount = $2 WHERE id = $3`, [couponCode, serverDiscount, newId]).catch(() => {});
       await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]).catch(() => {});
@@ -875,11 +877,11 @@ app.get('/api/wishlist', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const query = `
-      SELECT p.id, p.title, p.price, p.mrp, p.image_urls, p.category, w.created_at 
+      SELECT p.id, p.title, p.price, p.mrp, p.image_urls, p.category
       FROM products p
       JOIN wishlist w ON p.id = w.product_id
       WHERE w.user_id = $1
-      ORDER BY w.created_at DESC;
+      ORDER BY w.id DESC;
     `;
     const result = await pool.query(query, [userId]);
     res.json(result.rows);
@@ -1482,12 +1484,15 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS color_images JSONB DEFAULT '{}'`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS homepage_card_slot INTEGER`);
     // Orders table columns
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC DEFAULT 0`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_name TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS awb_number TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT`);
+    // Wishlist table columns
+    await pool.query(`ALTER TABLE wishlist ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
     console.log('Schema migrations complete');
   } catch (e) {
     console.error('Table init error:', e.message);
