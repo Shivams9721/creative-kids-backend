@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -11,7 +13,6 @@ const multer = require('multer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const nodemailer = require('nodemailer');
 const Razorpay = require('razorpay');
-require('dotenv').config();
 
 const app = express();
 
@@ -457,9 +458,9 @@ app.get('/api/homepage', async (req, res) => {
       pool.query(`
         SELECT p.* FROM products p
         LEFT JOIN (
-          SELECT (item->>'id')::int as pid, COUNT(*) as cnt
-          FROM orders, jsonb_array_elements(items::jsonb) item
-          WHERE status != 'Cancelled'
+          SELECT (jsonb_array_elements(items::jsonb)->>'id')::int as pid, COUNT(*) as cnt
+          FROM orders
+          WHERE status != 'Cancelled' AND items IS NOT NULL
           GROUP BY pid
         ) sales ON sales.pid = p.id
         WHERE ${base}
@@ -573,18 +574,20 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
     }
     const finalAmount = Math.max(0, serverTotal - serverDiscount);
 
-    // 3. Insert the order — use only columns guaranteed to exist
+    // 3. Insert the order using only existing columns
     const result = await client.query(
-      `INSERT INTO orders (phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id;`,
-      [address.phone, finalAmount, enrichedItems.length, 'Processing',
-       JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail]
+      `INSERT INTO orders (user_id, total_amount, status, payment_method, customer_name, coupon_code, discount_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id;`,
+      [req.user.id, finalAmount, 'Processing', paymentMethod, address.fullName, couponCode || null, serverDiscount]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
-    await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]).catch(() => {});
+    await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
+    // Store extended data in columns added by migration
+    await client.query(`UPDATE orders SET phone = $1, items_count = $2, shipping_address = $3, items = $4, user_email = $5 WHERE id = $6`,
+      [address.phone, enrichedItems.length, JSON.stringify(address), JSON.stringify(enrichedItems), userEmail, newId]
+    ).catch(() => {});
     if (couponCode && serverDiscount > 0) {
-      await client.query(`UPDATE orders SET coupon_code = $1, discount_amount = $2 WHERE id = $3`, [couponCode, serverDiscount, newId]).catch(() => {});
       await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]).catch(() => {});
     }
 
