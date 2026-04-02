@@ -119,10 +119,10 @@ if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is not set');
 // ==========================================
 let razorpay = null;
 
-if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+if ((process.env.RAZORPAY_KEY_ID || process.env.key_id) && (process.env.RAZORPAY_KEY_SECRET || process.env.key_secret)) {
   razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET
+    key_id: process.env.RAZORPAY_KEY_ID || process.env.key_id,
+    key_secret: process.env.RAZORPAY_KEY_SECRET || process.env.key_secret
   });
   console.log('✓ Razorpay initialized');
 } else {
@@ -1399,7 +1399,7 @@ app.post('/api/payment/verify', authenticateToken, validateRequest, async (req, 
     // Verify signature
     const sign = razorpay_order_id + '|' + razorpay_payment_id;
     const expectedSign = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || process.env.key_secret)
       .update(sign.toString())
       .digest('hex');
 
