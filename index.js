@@ -3,6 +3,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
+const rateLimit = require('express-rate-limit');
 const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -61,6 +62,13 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
+
+// Rate limiting
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts. Try again in 15 minutes.' } });
+const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+app.use('/api/auth', authLimiter);
+app.use('/api/admin/login', authLimiter);
+app.use('/api', apiLimiter);
 
 // Generate and send CSRF token to the frontend
 app.get('/api/csrf-token', (req, res) => {
@@ -257,11 +265,11 @@ app.post('/api/upload', authenticateAdmin, validateRequest, upload.single('image
 // 1. PRODUCT ROUTES
 // ==========================================
 
-// GET: All Products (only active, published ones for storefront)
+// GET: All Products (only active, published, non-draft ones for storefront)
 app.get('/api/products', async (req, res) => {
   try {
     const { sub_category, main_category, new_arrival } = req.query;
-    let query = `SELECT * FROM products WHERE is_active = true`;
+    let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const values = [];
     if (main_category) {
       values.push(main_category);
@@ -274,36 +282,31 @@ app.get('/api/products', async (req, res) => {
     if (new_arrival === 'true') {
       query += ` AND is_new_arrival = true`;
     }
-    query += ` ORDER BY id DESC`;
-    if (sub_category || main_category || new_arrival) query += ` LIMIT 120`;
-    query += `;`;
+    query += ` ORDER BY id DESC LIMIT 120;`;
     const allProducts = await pool.query(query, values);
     res.json(allProducts.rows);
   } catch (err) {
     console.error("Products GET Error:", err.message);
     res.status(500).json({ error: "Server Error" });
   }
-});
+})
 
-// GET: Single Product by ID
+// GET: Single Product by ID — only active products
 app.get('/api/products/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    if (isNaN(id)) return res.status(400).json({ message: "Invalid product ID" });
-    if (!id) return res.status(404).json({ message: "Product not found" });
-    const query = `SELECT * FROM products WHERE id = $1;`;
-    const product = await pool.query(query, [id]);
-
-    if (product.rows.length === 0) {
-      return res.status(404).json({ message: "Product not found" });
-    }
-
+    if (!id || id <= 0) return res.status(400).json({ message: "Invalid product ID" });
+    const product = await pool.query(
+      `SELECT * FROM products WHERE id = $1 AND is_active = true`,
+      [id]
+    );
+    if (product.rows.length === 0) return res.status(404).json({ message: "Product not found" });
     res.json(product.rows[0]);
   } catch (err) {
     console.error("Single Product GET Error:", err.message);
     res.status(500).json({ error: "Server Error" });
   }
-});
+})
 
 // POST: Add new product
 app.post("/api/products", authenticateAdmin, validateRequest, async (req, res) => {
@@ -442,23 +445,25 @@ app.delete("/api/products/:id", authenticateAdmin, validateRequest, async (req, 
 });
 
 
-// GET: Homepage data (new arrivals, bestsellers, featured)
+// GET: Homepage data
 app.get('/api/homepage', async (req, res) => {
   try {
-    const newArrivals = await pool.query(
-      `SELECT * FROM products WHERE is_active = true AND is_new_arrival = true ORDER BY created_at DESC LIMIT 4`
-    );
-    const bestsellers = await pool.query(
-      `SELECT * FROM products WHERE is_active = true ORDER BY id DESC LIMIT 4`
-    );
-    const featured = await pool.query(
-      `SELECT * FROM products WHERE is_active = true AND is_featured = true ORDER BY id DESC LIMIT 8`
-    );
-    res.json({
-      newArrivals: newArrivals.rows,
-      bestsellers: bestsellers.rows,
-      featured: featured.rows
-    });
+    const base = `is_active = true AND (is_draft = false OR is_draft IS NULL)`;
+    const [newArrivals, bestsellers, featured] = await Promise.all([
+      pool.query(`SELECT * FROM products WHERE ${base} AND is_new_arrival = true ORDER BY created_at DESC LIMIT 4`),
+      pool.query(`
+        SELECT p.* FROM products p
+        LEFT JOIN (
+          SELECT (item->>'id')::int as pid, COUNT(*) as cnt
+          FROM orders, jsonb_array_elements(items::jsonb) item
+          WHERE status != 'Cancelled'
+          GROUP BY pid
+        ) sales ON sales.pid = p.id
+        WHERE ${base}
+        ORDER BY COALESCE(sales.cnt, 0) DESC, p.id DESC LIMIT 4`),
+      pool.query(`SELECT * FROM products WHERE ${base} AND is_featured = true ORDER BY id DESC LIMIT 8`)
+    ]);
+    res.json({ newArrivals: newArrivals.rows, bestsellers: bestsellers.rows, featured: featured.rows });
   } catch (err) {
     console.error('Homepage GET Error:', err.message);
     res.status(500).json({ error: 'Server Error' });
@@ -545,21 +550,38 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
       enrichedItems.push({ ...item, price: parseFloat(product.price), title: product.title });
     }
 
-    const discountAmt = parseFloat(discountAmount) || 0;
-    const finalAmount = Math.max(0, serverTotal - discountAmt);
+    // 2. Server-side coupon validation — never trust client-supplied discountAmount
+    let serverDiscount = 0;
+    if (couponCode) {
+      const couponRes = await client.query(
+        `SELECT * FROM coupons WHERE UPPER(code) = UPPER($1) AND is_active = true
+         AND (expires_at IS NULL OR expires_at > NOW())
+         AND (max_uses IS NULL OR uses < max_uses)`,
+        [couponCode]
+      );
+      if (couponRes.rows.length > 0) {
+        const c = couponRes.rows[0];
+        if (serverTotal >= parseFloat(c.min_order_amount)) {
+          serverDiscount = c.discount_type === 'percent'
+            ? Math.round((serverTotal * parseFloat(c.discount_value)) / 100)
+            : parseFloat(c.discount_value);
+        }
+      }
+    }
+    const finalAmount = Math.max(0, serverTotal - serverDiscount);
 
-    // 2. Insert the order
+    // 3. Insert the order
     const result = await client.query(
       `INSERT INTO orders (customer_name, phone, total_amount, items_count, status, shipping_address, items, payment_method, user_email, coupon_code, discount_amount)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id;`,
       [address.fullName, address.phone, finalAmount, enrichedItems.length, 'Processing',
        JSON.stringify(address), JSON.stringify(enrichedItems), paymentMethod, userEmail,
-       couponCode || null, discountAmt]
+       couponCode || null, serverDiscount]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
     await client.query(`UPDATE orders SET order_number = $1 WHERE id = $2`, [orderNumber, newId]);
-    if (couponCode) {
+    if (couponCode && serverDiscount > 0) {
       await client.query('UPDATE coupons SET uses = uses + 1 WHERE UPPER(code) = UPPER($1)', [couponCode]);
     }
 

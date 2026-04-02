@@ -2,3 +2,6 @@ node_modules
 .env
 cookies.txt
 token_response.txt
+
+cookies.txt
+*.md
