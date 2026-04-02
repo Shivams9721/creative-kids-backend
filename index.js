@@ -817,26 +817,70 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
 // GET: Fetch user address
 app.get('/api/user/address', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT address FROM users WHERE id = $1', [req.user.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    let address = null;
-    try { address = result.rows[0].address ? JSON.parse(result.rows[0].address) : null; } catch {}
-    res.json({ address });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const result = await pool.query(
+      'SELECT * FROM addresses WHERE user_id = $1 ORDER BY is_default DESC, id ASC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PUT: Save user address
-app.put('/api/user/address', authenticateToken, async (req, res) => {
+// POST: Add new address
+app.post('/api/user/address', authenticateToken, async (req, res) => {
   try {
-    const { address } = req.body;
-    if (!address) return res.status(400).json({ error: 'Address is required' });
-    await pool.query('UPDATE users SET address = $1 WHERE id = $2', [JSON.stringify(address), req.user.id]);
+    const { fullName, phone, houseNo, roadName, city, state, pincode, landmark, is_default } = req.body;
+    if (!fullName || !phone || !houseNo || !roadName || !city || !state || !pincode)
+      return res.status(400).json({ error: 'All required fields must be filled.' });
+    // If setting as default, unset others
+    if (is_default) await pool.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    const result = await pool.query(
+      `INSERT INTO addresses (user_id, full_name, phone, house_no, road_name, city, state, pincode, landmark, is_default)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [req.user.id, fullName, phone, houseNo, roadName, city, state, pincode, landmark || '', is_default || false]
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT: Update an address
+app.put('/api/user/address/:id', authenticateToken, async (req, res) => {
+  try {
+    const { fullName, phone, houseNo, roadName, city, state, pincode, landmark, is_default } = req.body;
+    const addrId = parseInt(req.params.id, 10);
+    // Verify ownership
+    const own = await pool.query('SELECT id FROM addresses WHERE id = $1 AND user_id = $2', [addrId, req.user.id]);
+    if (own.rows.length === 0) return res.status(403).json({ error: 'Not your address.' });
+    if (is_default) await pool.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    const result = await pool.query(
+      `UPDATE addresses SET full_name=$1, phone=$2, house_no=$3, road_name=$4, city=$5, state=$6, pincode=$7, landmark=$8, is_default=$9
+       WHERE id=$10 RETURNING *`,
+      [fullName, phone, houseNo, roadName, city, state, pincode, landmark || '', is_default || false, addrId]
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE: Remove an address
+app.delete('/api/user/address/:id', authenticateToken, async (req, res) => {
+  try {
+    const addrId = parseInt(req.params.id, 10);
+    const own = await pool.query('SELECT id FROM addresses WHERE id = $1 AND user_id = $2', [addrId, req.user.id]);
+    if (own.rows.length === 0) return res.status(403).json({ error: 'Not your address.' });
+    await pool.query('DELETE FROM addresses WHERE id = $1', [addrId]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH: Set an address as default
+app.patch('/api/user/address/:id/default', authenticateToken, async (req, res) => {
+  try {
+    const addrId = parseInt(req.params.id, 10);
+    const own = await pool.query('SELECT id FROM addresses WHERE id = $1 AND user_id = $2', [addrId, req.user.id]);
+    if (own.rows.length === 0) return res.status(403).json({ error: 'Not your address.' });
+    await pool.query('UPDATE addresses SET is_default = false WHERE user_id = $1', [req.user.id]);
+    await pool.query('UPDATE addresses SET is_default = true WHERE id = $1', [addrId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // PUT: Update user profile (name, phone)
@@ -1514,6 +1558,20 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE wishlist ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS addresses (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      full_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      house_no TEXT NOT NULL,
+      road_name TEXT NOT NULL,
+      city TEXT NOT NULL,
+      state TEXT NOT NULL,
+      pincode TEXT NOT NULL,
+      landmark TEXT DEFAULT '',
+      is_default BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
     console.log('Schema migrations complete');
   } catch (e) {
     console.error('Table init error:', e.message);
