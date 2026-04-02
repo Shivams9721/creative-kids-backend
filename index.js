@@ -814,6 +814,31 @@ app.get('/api/user/orders', authenticateToken, async (req, res) => {
 });
 
 
+// GET: Fetch user address
+app.get('/api/user/address', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT address FROM users WHERE id = $1', [req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    let address = null;
+    try { address = result.rows[0].address ? JSON.parse(result.rows[0].address) : null; } catch {}
+    res.json({ address });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT: Save user address
+app.put('/api/user/address', authenticateToken, async (req, res) => {
+  try {
+    const { address } = req.body;
+    if (!address) return res.status(400).json({ error: 'Address is required' });
+    await pool.query('UPDATE users SET address = $1 WHERE id = $2', [JSON.stringify(address), req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PUT: Update user profile (name, phone)
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
@@ -1487,6 +1512,8 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT`);
     // Wishlist table columns
     await pool.query(`ALTER TABLE wishlist ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
     console.log('Schema migrations complete');
   } catch (e) {
     console.error('Table init error:', e.message);
