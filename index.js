@@ -19,7 +19,7 @@ const app = express();
 app.use(helmet());
 
 // CSRF Protection Setup
-let generateToken, validateRequest, invalidCsrfTokenError;
+let generateCsrfToken, validateRequest, invalidCsrfTokenError;
 try {
   const csrf = doubleCsrf({
     getSecret: () => process.env.CSRF_SECRET || 'fallback-secret',
@@ -30,12 +30,13 @@ try {
       secure: process.env.NODE_ENV === 'production',
     },
   });
-  generateToken = csrf.generateToken;
+  generateCsrfToken = csrf.generateCsrfToken;
   validateRequest = csrf.validateRequest;
   invalidCsrfTokenError = csrf.invalidCsrfTokenError;
+  console.log('✓ CSRF initialized');
 } catch(e) {
   console.warn('CSRF setup failed, using no-op:', e.message);
-  generateToken = (req, res) => 'none';
+  generateCsrfToken = (req, res) => 'none';
   validateRequest = (req, res, next) => next();
   invalidCsrfTokenError = null;
 }
@@ -57,7 +58,7 @@ app.use(cookieParser());
 
 // Generate and send CSRF token to the frontend
 app.get('/api/csrf-token', (req, res) => {
-  const csrfToken = generateToken(req, res);
+  const csrfToken = generateCsrfToken(req, res);
   res.json({ csrfToken });
 });
 
