@@ -1378,7 +1378,7 @@ app.post('/api/payment/create-order', authenticateToken, validateRequest, async 
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
-      key_id: process.env.RAZORPAY_KEY_ID
+      key_id: razorpay.key_id
     });
   } catch (err) {
     console.error('Razorpay Order Creation Error:', err);
