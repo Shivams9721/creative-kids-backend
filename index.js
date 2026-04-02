@@ -455,16 +455,7 @@ app.get('/api/homepage', async (req, res) => {
     const base = `is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const [newArrivals, bestsellers, featured] = await Promise.all([
       pool.query(`SELECT * FROM products WHERE ${base} AND is_new_arrival = true ORDER BY created_at DESC LIMIT 4`),
-      pool.query(`
-        SELECT p.* FROM products p
-        LEFT JOIN (
-          SELECT (jsonb_array_elements(items::jsonb)->>'id')::int as pid, COUNT(*) as cnt
-          FROM orders
-          WHERE status != 'Cancelled' AND items IS NOT NULL
-          GROUP BY pid
-        ) sales ON sales.pid = p.id
-        WHERE ${base}
-        ORDER BY COALESCE(sales.cnt, 0) DESC, p.id DESC LIMIT 4`),
+      pool.query(`SELECT * FROM products WHERE ${base} ORDER BY id DESC LIMIT 4`),
       pool.query(`SELECT * FROM products WHERE ${base} AND is_featured = true ORDER BY id DESC LIMIT 8`)
     ]);
     res.json({ newArrivals: newArrivals.rows, bestsellers: bestsellers.rows, featured: featured.rows });
