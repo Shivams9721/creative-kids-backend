@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const { doubleCsrf } = require('csrf-csrf');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 const pool = require('./db');
@@ -18,29 +17,32 @@ const app = express();
 // Security headers via helmet (all protections enabled)
 app.use(helmet());
 
-// CSRF Protection Setup
-let generateCsrfToken, validateRequest, invalidCsrfTokenError;
-try {
-  const csrf = doubleCsrf({
-    getSecret: () => process.env.CSRF_SECRET || 'fallback-secret',
-    getSessionIdentifier: (req) => req.ip || req.headers['x-forwarded-for'] || '',
-    cookieName: "__host-psifi.x-csrf-token",
-    cookieOptions: {
-      sameSite: "lax",
-      path: "/",
-      secure: process.env.NODE_ENV === 'production',
-    },
-  });
-  generateCsrfToken = csrf.generateCsrfToken;
-  validateRequest = csrf.validateRequest;
-  invalidCsrfTokenError = csrf.invalidCsrfTokenError;
-  console.log('✓ CSRF initialized');
-} catch(e) {
-  console.warn('CSRF setup failed, using no-op:', e.message);
-  generateCsrfToken = (req, res) => 'none';
-  validateRequest = (req, res, next) => next();
-  invalidCsrfTokenError = null;
-}
+// CSRF — lightweight token using HMAC (no external library)
+// Real security is provided by JWT auth + strict CORS origin allowlist
+const CSRF_SECRET = process.env.CSRF_SECRET || crypto.randomBytes(32).toString('hex');
+
+const generateCsrfToken = (req, res) => {
+  const token = crypto.randomBytes(32).toString('hex');
+  const sig = crypto.createHmac('sha256', CSRF_SECRET).update(token).digest('hex');
+  const csrfToken = `${token}.${sig}`;
+  res.cookie('__csrf', csrfToken, { httpOnly: false, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' });
+  return csrfToken;
+};
+
+const validateRequest = (req, res, next) => {
+  // Skip CSRF for GET/HEAD/OPTIONS
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const token = req.headers['x-csrf-token'] || '';
+  const [raw, sig] = token.split('.');
+  if (!raw || !sig) return res.status(403).json({ error: 'Invalid CSRF token' });
+  const expected = crypto.createHmac('sha256', CSRF_SECRET).update(raw).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return res.status(403).json({ error: 'Invalid CSRF token' });
+  }
+  next();
+};
+
+const invalidCsrfTokenError = null;
 
 // Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
@@ -1424,21 +1426,11 @@ app.post('/api/payment/status', authenticateToken, async (req, res) => {
 // GLOBAL ERROR HANDLER
 // ==========================================
 app.use((err, req, res, next) => {
-  if (err === invalidCsrfTokenError) {
-    res.status(403).json({ error: "Invalid CSRF token" });
-  } else if (err) {
-    // Log the full error for your own debugging
-    console.error("UNHANDLED_ERROR:", err.stack || err);
-
-    // Send a generic, safe error message to the client in production
-    if (process.env.NODE_ENV === 'production') {
-      return res.status(500).json({ error: 'An internal server error occurred.' });
-    }
-    // In development, you might want to send the stack trace
-    res.status(500).json({ error: 'An internal server error occurred.', details: err.message });
-  } else {
-    next(err);
+  console.error("UNHANDLED_ERROR:", err.stack || err);
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(500).json({ error: 'An internal server error occurred.' });
   }
+  res.status(500).json({ error: 'An internal server error occurred.', details: err.message });
 });
 
 // ==========================================
