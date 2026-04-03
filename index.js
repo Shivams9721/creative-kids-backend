@@ -55,7 +55,8 @@ const invalidCsrfTokenError = null;
 // Middleware (Updated CORS for AWS Amplify and Custom Domains)
 app.use(cors({
     origin: [
-      'http://localhost:3000', 
+      'http://localhost:3000',
+      'http://localhost:3001',
       'https://main.d1ucppcuwyaa0p.amplifyapp.com',
       'https://creativekids.com',
       'https://www.creativekids.com',
@@ -272,7 +273,7 @@ app.post('/api/upload', authenticateAdmin, validateRequest, upload.single('image
 // GET: All Products (only active, published, non-draft ones for storefront)
 app.get('/api/products', async (req, res) => {
   try {
-    const { sub_category, main_category, new_arrival } = req.query;
+    const { sub_category, main_category, new_arrival, q } = req.query;
     let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const values = [];
     if (main_category) {
@@ -285,6 +286,10 @@ app.get('/api/products', async (req, res) => {
     }
     if (new_arrival === 'true') {
       query += ` AND is_new_arrival = true`;
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      query += ` AND (title ILIKE $${values.length} OR description ILIKE $${values.length} OR color ILIKE $${values.length} OR main_category ILIKE $${values.length})`;
     }
     query += ` ORDER BY id DESC LIMIT 120;`;
     const allProducts = await pool.query(query, values);
@@ -312,57 +317,95 @@ app.get('/api/products/:id', async (req, res) => {
   }
 })
 
-// POST: Add new product
+// GET: Sibling products by variant_group_id (for color swatches)
+app.get('/api/products/group/:groupId', async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    if (!groupId || groupId === 'undefined') return res.status(400).json({ message: "Invalid group ID" });
+
+    const siblings = await pool.query(
+      `SELECT id, color, image_urls, sku FROM products WHERE variant_group_id = $1 AND is_active = true`,
+      [groupId]
+    );
+    res.json(siblings.rows);
+  } catch (err) {
+    console.error("Group GET Error:", err.message);
+    res.status(500).json({ error: "Server Error" });
+  }
+});
+
+// POST: Add new product (Grouped Architecture)
 app.post("/api/products", authenticateAdmin, validateRequest, async (req, res) => {
+  const client = await pool.connect();
   try {
     const {
-      title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-      sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      title, description, price, mrp, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+      sku: baseSku, hsn_code, fabric, pattern, neck_type, belt_included,
       closure_type, length_type,
       manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, variants, extra_categories, color_images
+      primary_category, main_category, sub_category, item_type, variants, cross_listed_categories, extra_categories, color_images,
+      is_draft, is_cod_eligible, weight
     } = req.body;
-
-    const { is_draft } = req.body;
 
     // Validate product data
     const validationError = validateProductData(req.body, is_draft);
-    if (validationError) {
-      return res.status(400).json({ error: validationError });
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    await client.query('BEGIN');
+    
+    const variantGroupId = crypto.randomUUID();
+    const createdProducts = [];
+    
+    const finalMainCat = primary_category || main_category || 'Uncategorized';
+    const finalSubCat = item_type || sub_category || 'Uncategorized';
+    const finalCrossListed = cross_listed_categories || extra_categories || [];
+
+    // Insert a distinct row for every color
+    for (const color of (colors || [])) {
+      const colorCode = color.replace(/\s+/g, '').substring(0, 3).toUpperCase();
+      const productSku = baseSku ? `${baseSku}-${colorCode}` : `SKU-${Date.now()}-${colorCode}`;
+      
+      const colorSpecificVariants = (variants || []).filter(v => v.color === color);
+      const specificImageUrls = (color_images || {})[color] || [];
+
+      const query = `
+        INSERT INTO products (
+          title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+          sku, hsn_code, fabric, pattern, neck_type, belt_included, closure_type, length_type,
+          manufacturer_details, care_instructions, origin_country,
+          main_category, sub_category, item_type, category, variants, extra_categories, color_images, is_draft, variant_group_id, color
+        ) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32) 
+        RETURNING *;
+      `;
+
+      const values = [
+        `${title} - ${color}`, description, price, mrp, 
+        JSON.stringify(specificImageUrls), JSON.stringify(sizes), JSON.stringify(colors), 
+        is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+        productSku, hsn_code, fabric, pattern, neck_type, belt_included,
+        closure_type || null, length_type || null,
+        manufacturer_details, care_instructions, origin_country,
+        finalMainCat, finalSubCat, item_type, finalSubCat,
+        JSON.stringify(colorSpecificVariants),
+        JSON.stringify(finalCrossListed),
+        JSON.stringify(color_images || {}),
+        is_draft || false, variantGroupId, color
+      ];
+
+      const newProduct = await client.query(query, values);
+      createdProducts.push(newProduct.rows[0]);
     }
 
-    const query = `
-      INSERT INTO products (
-        title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-        sku, hsn_code, fabric, pattern, neck_type, belt_included, closure_type, length_type,
-        manufacturer_details, care_instructions, origin_country,
-        main_category, sub_category, item_type, category, variants, extra_categories, color_images, is_draft
-      ) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) 
-      RETURNING *;
-    `;
-
-    const values = [
-      title, description, price, mrp, 
-      JSON.stringify(image_urls), 
-      JSON.stringify(sizes), 
-      JSON.stringify(colors), 
-      is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-      sku, hsn_code, fabric, pattern, neck_type, belt_included,
-      closure_type || null, length_type || null,
-      manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, sub_category,
-      JSON.stringify(variants),
-      JSON.stringify(extra_categories || []),
-      JSON.stringify(color_images || {}),
-      is_draft || false
-    ];
-
-    const newProduct = await pool.query(query, values);
-    res.json(newProduct.rows[0]);
+    await client.query('COMMIT');
+    // Return the first inserted product so the frontend succeeds gracefully
+    res.json(createdProducts[0] || {});
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error("Product POST Error:", err.message);
     res.status(500).json({ error: "Server Error" });
+  } finally {
+    client.release();
   }
 });
 
@@ -376,60 +419,144 @@ app.put("/api/products/:id/restore", authenticateAdmin, validateRequest, async (
   }
 });
 
-// PUT: Update an existing product
+// PATCH: Update only the variants/stock for a product (lightweight — no full validation)
+app.patch("/api/products/:id/stock", authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || id <= 0) return res.status(400).json({ error: "Invalid product ID" });
+    const { variants } = req.body;
+    if (!variants) return res.status(400).json({ error: "variants required" });
+    await pool.query("UPDATE products SET variants = $1 WHERE id = $2", [JSON.stringify(variants), id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT: Update an existing product (Grouped Architecture)
 app.put("/api/products/:id", authenticateAdmin, validateRequest, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const {
-      title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-      sku, hsn_code, fabric, pattern, neck_type, belt_included,
+      title, description, price, mrp, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+      sku: baseSku, hsn_code, fabric, pattern, neck_type, belt_included,
       closure_type, length_type,
       manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, variants, extra_categories, color_images
+      primary_category, main_category, sub_category, item_type, variants, cross_listed_categories, extra_categories, color_images,
+      is_draft, is_cod_eligible, weight
     } = req.body;
-
-    const { is_draft } = req.body;
 
     // Validate product data
     const validationError = validateProductData(req.body, is_draft);
-    if (validationError) {
-      return res.status(400).json({ error: validationError });
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    await client.query('BEGIN');
+
+    // 1. Get the variant_group_id of the product being edited
+    const currentProdRes = await client.query('SELECT variant_group_id FROM products WHERE id = $1', [id]);
+    if (currentProdRes.rows.length === 0) throw new Error('Product not found');
+    
+    let variantGroupId = currentProdRes.rows[0].variant_group_id;
+    
+    // Backward Compatibility: Assign UUID if editing a legacy product without one
+    if (!variantGroupId) {
+      variantGroupId = crypto.randomUUID();
+      await client.query('UPDATE products SET variant_group_id = $1 WHERE id = $2', [variantGroupId, id]);
     }
 
-    const query = `
-      UPDATE products SET 
-        title = $1, description = $2, price = $3, mrp = $4, image_urls = $5, sizes = $6, colors = $7, 
-        is_featured = $8, is_new_arrival = $9, homepage_section = $10, homepage_card_slot = $11,
-        sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17,
-        closure_type = $18, length_type = $19,
-        manufacturer_details = $20, care_instructions = $21, origin_country = $22,
-        main_category = $23, sub_category = $24, item_type = $25, category = $26, variants = $27,
-        extra_categories = $28, color_images = $29, is_draft = $30
-      WHERE id = $31 RETURNING *;
-    `;
+    const finalMainCat = primary_category || main_category || 'Uncategorized';
+    const finalSubCat = item_type || sub_category || 'Uncategorized';
+    const finalCrossListed = cross_listed_categories || extra_categories || [];
+    const processedColors = [];
 
-    const values = [
-      title, description, price, mrp, 
-      JSON.stringify(image_urls), 
-      JSON.stringify(sizes), 
-      JSON.stringify(colors), 
-      is_featured, is_new_arrival, homepage_section, homepage_card_slot,
-      sku, hsn_code, fabric, pattern, neck_type, belt_included,
-      closure_type || null, length_type || null,
-      manufacturer_details, care_instructions, origin_country,
-      main_category, sub_category, item_type, sub_category,
-      JSON.stringify(variants),
-      JSON.stringify(extra_categories || []),
-      JSON.stringify(color_images || {}),
-      is_draft || false,
-      id
-    ];
+    // 2. Iterate through submitted colors
+    for (const color of colors) {
+      processedColors.push(color);
+      
+      const colorCode = color.replace(/\s+/g, '').substring(0, 3).toUpperCase();
+      const productSku = baseSku ? `${baseSku}-${colorCode}` : `SKU-${Date.now()}-${colorCode}`;
+      
+      // Isolate this color's specific images and variants
+      const colorSpecificVariants = (variants || []).filter(v => v.color === color);
+      const specificImageUrls = (color_images || {})[color] || [];
 
-    const updatedProduct = await pool.query(query, values);
+      // Check if this color already exists in the group
+      const existingRes = await client.query(
+        'SELECT id FROM products WHERE variant_group_id = $1 AND color = $2',
+        [variantGroupId, color]
+      );
+
+      if (existingRes.rows.length > 0) {
+        // Update existing linked product
+        const existingId = existingRes.rows[0].id;
+        await client.query(`
+          UPDATE products SET 
+            title = $1, description = $2, price = $3, mrp = $4, image_urls = $5, sizes = $6, colors = $7, 
+            is_featured = $8, is_new_arrival = $9, homepage_section = $10, homepage_card_slot = $11,
+            sku = $12, hsn_code = $13, fabric = $14, pattern = $15, neck_type = $16, belt_included = $17,
+            closure_type = $18, length_type = $19,
+            manufacturer_details = $20, care_instructions = $21, origin_country = $22,
+            main_category = $23, sub_category = $24, item_type = $25, category = $26, variants = $27,
+            extra_categories = $28, color_images = $29, is_draft = $30, color = $31, is_active = true
+          WHERE id = $32;
+        `, [
+          `${title} - ${color}`, description, price, mrp, 
+          JSON.stringify(specificImageUrls), JSON.stringify(sizes), JSON.stringify(colors), 
+          is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+          productSku, hsn_code, fabric, pattern, neck_type, belt_included,
+          closure_type || null, length_type || null,
+          manufacturer_details, care_instructions, origin_country,
+          finalMainCat, finalSubCat, item_type, finalSubCat,
+          JSON.stringify(colorSpecificVariants),
+          JSON.stringify(finalCrossListed),
+          JSON.stringify(color_images || {}),
+          is_draft || false, color, existingId
+        ]);
+      } else {
+        // Insert new linked product (New color added during edit)
+        await client.query(`
+          INSERT INTO products (
+            title, description, price, mrp, image_urls, sizes, colors, is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+            sku, hsn_code, fabric, pattern, neck_type, belt_included, closure_type, length_type,
+            manufacturer_details, care_instructions, origin_country,
+            main_category, sub_category, item_type, category, variants, extra_categories, color_images, is_draft, variant_group_id, color
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+        `, [
+          `${title} - ${color}`, description, price, mrp, 
+          JSON.stringify(specificImageUrls), JSON.stringify(sizes), JSON.stringify(colors), 
+          is_featured, is_new_arrival, homepage_section, homepage_card_slot,
+          productSku, hsn_code, fabric, pattern, neck_type, belt_included,
+          closure_type || null, length_type || null,
+          manufacturer_details, care_instructions, origin_country,
+          finalMainCat, finalSubCat, item_type, finalSubCat,
+          JSON.stringify(colorSpecificVariants),
+          JSON.stringify(finalCrossListed),
+          JSON.stringify(color_images || {}),
+          is_draft || false, variantGroupId, color
+        ]);
+      }
+    }
+
+    // 3. Soft-delete products in this group whose color was removed during the edit
+    if (processedColors.length > 0) {
+      await client.query(`
+        UPDATE products SET is_active = false 
+        WHERE variant_group_id = $1 AND color != ALL($2::text[])
+      `, [variantGroupId, processedColors]);
+    }
+
+    await client.query('COMMIT');
+    
+    // Return one of the updated rows for the frontend
+    const updatedProduct = await client.query('SELECT * FROM products WHERE id = $1', [id]);
     res.json(updatedProduct.rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error("Product PUT Error:", err.message);
     res.status(500).json({ error: "Server Error" });
+  } finally {
+    client.release();
   }
 });
 
@@ -472,7 +599,34 @@ app.get('/api/homepage', async (req, res) => {
 // GET: All products for Admin (including soft-deleted)
 app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
   try {
-    const allProducts = await pool.query(`SELECT * FROM products ORDER BY id DESC;`);
+    const query = `
+      SELECT 
+        COALESCE(variant_group_id, id::text) as variant_group_id,
+        MAX(id) as id,
+        MAX(title) as title,
+        MAX(sku) as base_sku,
+        MAX(price) as price,
+        MAX(mrp) as mrp,
+        MAX(primary_category) as primary_category,
+        MAX(item_type) as item_type,
+        MAX(is_active::int)::boolean as is_active,
+        MAX(is_draft::int)::boolean as is_draft,
+        MAX(created_at) as created_at,
+        json_agg(
+          json_build_object(
+            'id', id,
+            'color', color,
+            'sku', sku,
+            'image_urls', image_urls,
+            'variants', variants,
+            'is_active', is_active
+          ) ORDER BY id ASC
+        ) as child_variants
+      FROM products
+      GROUP BY COALESCE(variant_group_id, id::text)
+      ORDER BY MAX(id) DESC;
+    `;
+    const allProducts = await pool.query(query);
     res.json(allProducts.rows);
   } catch (err) {
     res.status(500).json({ error: "Server Error", details: err.message });
@@ -1360,8 +1514,8 @@ app.post('/api/returns', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'A return request already exists for this order.' });
 
     const result = await pool.query(
-      'INSERT INTO returns (order_id, order_number, user_id, reason, comments) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [order_id, order_number, userId, reason, comments || null]
+      'INSERT INTO returns (order_id, order_number, user_id, reason, comments, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [order_id, order_number, userId, reason, comments || null, 'Pending']
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -1438,7 +1592,7 @@ app.post('/api/payment/create-order', authenticateToken, validateRequest, async 
       order_id: order.id,
       amount: order.amount,
       currency: order.currency,
-      key_id: razorpay.key_id
+      key_id: process.env.RAZORPAY_KEY_ID || process.env.key_id
     });
   } catch (err) {
     console.error('Razorpay Order Creation Error:', err);
@@ -1546,6 +1700,8 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS extra_categories JSONB DEFAULT '[]'`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS color_images JSONB DEFAULT '{}'`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS homepage_card_slot INTEGER`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS variant_group_id TEXT`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS color TEXT`);
     // Orders table columns
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
@@ -1573,6 +1729,18 @@ app.listen(PORT, async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     console.log('Schema migrations complete');
+    // Ensure returns table has status column
+    await pool.query(`CREATE TABLE IF NOT EXISTS returns (
+      id SERIAL PRIMARY KEY,
+      order_id INTEGER NOT NULL,
+      order_number TEXT,
+      user_id INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      comments TEXT,
+      status TEXT DEFAULT 'Pending',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Pending'`);
   } catch (e) {
     console.error('Table init error:', e.message);
   }
