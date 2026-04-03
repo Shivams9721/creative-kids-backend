@@ -273,16 +273,80 @@ app.post('/api/upload', authenticateAdmin, validateRequest, upload.single('image
 // GET: All Products (only active, published, non-draft ones for storefront)
 app.get('/api/products', async (req, res) => {
   try {
-    const { sub_category, main_category, new_arrival, q } = req.query;
+    const { sub_category, main_category, new_arrival, q, item_type, baby_all, kids_all,
+            sizes, colors, fabrics, patterns, necks, price_min, price_max } = req.query;
     let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const values = [];
-    if (main_category) {
+
+    // Category filters
+    if (baby_all === 'true') {
+      query += ` AND main_category IN ('Baby boys', 'Baby girls')`;
+    } else if (kids_all === 'true') {
+      query += ` AND main_category IN ('Boys clothing', 'Girls clothing')`;
+    } else if (main_category) {
       values.push(main_category);
       query += ` AND main_category = $${values.length}`;
     }
-    if (sub_category) {
+
+    // Item type filter (checks both item_type and sub_category columns)
+    if (item_type) {
+      values.push(item_type);
+      query += ` AND (item_type = $${values.length} OR sub_category = $${values.length})`;
+    } else if (sub_category) {
       values.push(sub_category);
       query += ` AND sub_category = $${values.length}`;
+    }
+
+    // Price range
+    if (price_min) { values.push(parseFloat(price_min)); query += ` AND price::numeric >= $${values.length}`; }
+    if (price_max) { values.push(parseFloat(price_max)); query += ` AND price::numeric <= $${values.length}`; }
+
+    // Fabric filter
+    if (fabrics) {
+      const fabricList = fabrics.split(',').map(f => f.trim()).filter(Boolean);
+      if (fabricList.length > 0) {
+        values.push(fabricList);
+        query += ` AND fabric = ANY($${values.length}::text[])`;
+      }
+    }
+
+    // Pattern filter
+    if (patterns) {
+      const patternList = patterns.split(',').map(p => p.trim()).filter(Boolean);
+      if (patternList.length > 0) {
+        values.push(patternList);
+        query += ` AND pattern = ANY($${values.length}::text[])`;
+      }
+    }
+
+    // Neck type filter
+    if (necks) {
+      const neckList = necks.split(',').map(n => n.trim()).filter(Boolean);
+      if (neckList.length > 0) {
+        values.push(neckList);
+        query += ` AND neck_type = ANY($${values.length}::text[])`;
+      }
+    }
+
+    // Color filter (color is a top-level column)
+    if (colors) {
+      const colorList = colors.split(',').map(c => c.trim()).filter(Boolean);
+      if (colorList.length > 0) {
+        values.push(colorList);
+        query += ` AND color = ANY($${values.length}::text[])`;
+      }
+    }
+
+    // Size filter (sizes stored as JSON array — check if any selected size is in the array)
+    if (sizes) {
+      const sizeList = sizes.split(',').map(s => s.trim()).filter(Boolean);
+      if (sizeList.length > 0) {
+        const sizeClauses = sizeList.map(s => {
+          values.push(`%${s}%`);
+          return `sizes::text ILIKE $${values.length}`;
+        });
+        query += ` AND (${sizeClauses.join(' OR ')})`;
+      }
     }
     if (new_arrival === 'true') {
       query += ` AND is_new_arrival = true`;
