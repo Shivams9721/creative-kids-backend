@@ -605,12 +605,13 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
         MAX(id) as id,
         MAX(title) as title,
         MAX(sku) as base_sku,
-        MAX(price) as price,
-        MAX(mrp) as mrp,
-        MAX(primary_category) as primary_category,
+        MAX(price::numeric) as price,
+        MAX(mrp::numeric) as mrp,
+        MAX(main_category) as main_category,
+        MAX(sub_category) as sub_category,
         MAX(item_type) as item_type,
-        MAX(is_active::int)::boolean as is_active,
-        MAX(is_draft::int)::boolean as is_draft,
+        bool_or(is_active) as is_active,
+        bool_or(is_draft) as is_draft,
         MAX(created_at) as created_at,
         json_agg(
           json_build_object(
@@ -629,6 +630,7 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
     const allProducts = await pool.query(query);
     res.json(allProducts.rows);
   } catch (err) {
+    console.error("Admin Products Error:", err.message);
     res.status(500).json({ error: "Server Error", details: err.message });
   }
 });
