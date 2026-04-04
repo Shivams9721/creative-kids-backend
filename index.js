@@ -2216,6 +2216,223 @@ app.post('/api/payment/status', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// 17. EASYECOM INTEGRATION
+// ==========================================
+
+const EASYECOM_BASE = 'https://api.easyecom.io';
+let easyecomToken = null;
+let easyecomTokenExpiry = null;
+
+// Get/refresh EasyEcom JWT token
+const getEasyEcomToken = async () => {
+  if (easyecomToken && easyecomTokenExpiry && Date.now() < easyecomTokenExpiry) {
+    return easyecomToken;
+  }
+  const res = await fetch(`${EASYECOM_BASE}/access/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: process.env.EASYECOM_EMAIL,
+      password: process.env.EASYECOM_API_KEY,
+    })
+  });
+  const data = await res.json();
+  if (!res.ok || !data.data?.jwt_token) throw new Error(data.message || 'EasyEcom auth failed');
+  easyecomToken = data.data.jwt_token;
+  easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000); // 23 hours
+  return easyecomToken;
+};
+
+const easyecomHeaders = async () => ({
+  'Content-Type': 'application/json',
+  'Authorization': `Bearer ${await getEasyEcomToken()}`,
+  'x-api-key': process.env.EASYECOM_API_KEY,
+});
+
+// Fuzzy SKU match score (0-100)
+const skuMatchScore = (a, b) => {
+  if (!a || !b) return 0;
+  const norm = s => s.toLowerCase().replace(/[-_\s]/g, '');
+  const na = norm(a), nb = norm(b);
+  if (na === nb) return 100;
+  if (na.includes(nb) || nb.includes(na)) return 85;
+  // Levenshtein distance
+  const m = na.length, n = nb.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => i === 0 ? j : j === 0 ? i : 0));
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
+    dp[i][j] = na[i-1] === nb[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+  }
+  const maxLen = Math.max(m, n);
+  return Math.round((1 - dp[m][n] / maxLen) * 100);
+};
+
+// POST: Connect EasyEcom (test credentials)
+app.post('/api/admin/easyecom/connect', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    easyecomToken = null; // force refresh
+    const token = await getEasyEcomToken();
+    await pool.query(`INSERT INTO store_settings (key, value) VALUES ('easyecom_connected', 'true') ON CONFLICT (key) DO UPDATE SET value = 'true'`);
+    res.json({ success: true, message: 'EasyEcom connected successfully' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// GET: EasyEcom sync status
+app.get('/api/admin/easyecom/status', authenticateAdmin, async (req, res) => {
+  try {
+    const [lastSync, mappings] = await Promise.all([
+      pool.query(`SELECT value FROM store_settings WHERE key = 'easyecom_last_sync'`),
+      pool.query(`SELECT status, COUNT(*) FROM sku_mappings GROUP BY status`),
+    ]);
+    const counts = {};
+    mappings.rows.forEach(r => { counts[r.status] = parseInt(r.count); });
+    res.json({
+      connected: true,
+      last_sync: lastSync.rows[0]?.value || null,
+      mappings: counts,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST: Full sync — fetch all EasyEcom inventory and match/update
+app.post('/api/admin/easyecom/sync', authenticateAdmin, async (req, res) => {
+  try {
+    const headers = await easyecomHeaders();
+    const warehouseCode = process.env.EASYECOM_WAREHOUSE_CODE || '7210';
+
+    // Fetch inventory from EasyEcom (paginated)
+    let page = 1, allItems = [];
+    while (true) {
+      const invRes = await fetch(`${EASYECOM_BASE}/inventory/getInventoryByWarehouse`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ warehouse_code: warehouseCode, page_no: page, page_size: 100 })
+      });
+      const invData = await invRes.json();
+      const items = invData.data?.inventory || invData.data || [];
+      if (!Array.isArray(items) || items.length === 0) break;
+      allItems = allItems.concat(items);
+      if (items.length < 100) break;
+      page++;
+    }
+
+    if (allItems.length === 0) return res.json({ success: true, message: 'No inventory data from EasyEcom', synced: 0 });
+
+    // Build EasyEcom SKU → quantity map
+    const easyecomMap = {};
+    allItems.forEach(item => {
+      const sku = item.sku || item.product_sku || item.item_sku;
+      const qty = parseInt(item.available_quantity || item.quantity || item.available || 0);
+      if (sku) easyecomMap[sku] = qty;
+    });
+
+    // Get all our products with their variants
+    const products = await pool.query(`SELECT id, sku, variants FROM products WHERE is_active = true`);
+    let synced = 0, unmatched = 0, updated = 0;
+
+    for (const product of products.rows) {
+      let variants = [];
+      try { variants = typeof product.variants === 'string' ? JSON.parse(product.variants) : (product.variants || []); } catch {}
+
+      let productUpdated = false;
+      const updatedVariants = variants.map(v => {
+        const variantSku = v.sku || product.sku;
+        if (!variantSku) return v;
+
+        // Try exact match first
+        if (easyecomMap[variantSku] !== undefined) {
+          const newStock = easyecomMap[variantSku];
+          if (newStock !== parseInt(v.stock)) {
+            // Log the change
+            pool.query(
+              `INSERT INTO inventory_sync_log (sku, source, old_stock, new_stock) VALUES ($1, 'easyecom', $2, $3)`,
+              [variantSku, parseInt(v.stock) || 0, newStock]
+            ).catch(() => {});
+            productUpdated = true;
+            synced++;
+            return { ...v, stock: newStock };
+          }
+          return v;
+        }
+
+        // Try fuzzy match
+        let bestSku = null, bestScore = 0;
+        for (const eSku of Object.keys(easyecomMap)) {
+          const score = skuMatchScore(variantSku, eSku);
+          if (score > bestScore) { bestScore = score; bestSku = eSku; }
+        }
+
+        if (bestScore >= 85 && bestSku) {
+          // Auto-confirm high confidence match
+          pool.query(
+            `INSERT INTO sku_mappings (internal_sku, easyecom_sku, match_score, status) VALUES ($1, $2, $3, 'confirmed')
+             ON CONFLICT (internal_sku) DO UPDATE SET easyecom_sku = $2, match_score = $3, status = 'confirmed'`,
+            [variantSku, bestSku, bestScore]
+          ).catch(() => {});
+          const newStock = easyecomMap[bestSku];
+          productUpdated = true; synced++;
+          return { ...v, stock: newStock };
+        } else if (bestScore >= 50 && bestSku) {
+          // Queue for review
+          pool.query(
+            `INSERT INTO sku_mappings (internal_sku, easyecom_sku, match_score, status) VALUES ($1, $2, $3, 'pending')
+             ON CONFLICT (internal_sku) DO NOTHING`,
+            [variantSku, bestSku, bestScore]
+          ).catch(() => {});
+          unmatched++;
+        } else {
+          // No match
+          pool.query(
+            `INSERT INTO sku_mappings (internal_sku, easyecom_sku, match_score, status) VALUES ($1, NULL, 0, 'unmatched')
+             ON CONFLICT (internal_sku) DO NOTHING`,
+            [variantSku]
+          ).catch(() => {});
+          unmatched++;
+        }
+        return v;
+      });
+
+      if (productUpdated) {
+        await pool.query('UPDATE products SET variants = $1 WHERE id = $2', [JSON.stringify(updatedVariants), product.id]);
+        updated++;
+      }
+    }
+
+    // Save last sync time
+    await pool.query(
+      `INSERT INTO store_settings (key, value) VALUES ('easyecom_last_sync', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [new Date().toISOString()]
+    );
+
+    res.json({ success: true, synced, unmatched, products_updated: updated, easyecom_skus: Object.keys(easyecomMap).length });
+  } catch (err) {
+    console.error('EasyEcom Sync Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: All SKU mappings (for reconciliation page)
+app.get('/api/admin/sku-mappings', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM sku_mappings ORDER BY match_score DESC, created_at DESC');
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT: Confirm or reject a SKU mapping
+app.put('/api/admin/sku-mappings/:id', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const { status, easyecom_sku } = req.body; // status: 'confirmed' | 'rejected'
+    const result = await pool.query(
+      `UPDATE sku_mappings SET status = $1, easyecom_sku = COALESCE($2, easyecom_sku), last_synced_at = NOW() WHERE id = $3 RETURNING *`,
+      [status, easyecom_sku || null, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Temp: inspect what category values exist in DB ──────────────────────────
 app.get('/api/admin/debug/categories', authenticateAdmin, async (req, res) => {
   try {
@@ -2301,6 +2518,24 @@ app.listen(PORT, async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     console.log('Schema migrations complete');
+    // EasyEcom tables
+    await pool.query(`CREATE TABLE IF NOT EXISTS sku_mappings (
+      id SERIAL PRIMARY KEY,
+      internal_sku TEXT NOT NULL UNIQUE,
+      easyecom_sku TEXT,
+      match_score INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      last_synced_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS inventory_sync_log (
+      id SERIAL PRIMARY KEY,
+      sku TEXT NOT NULL,
+      source TEXT DEFAULT 'easyecom',
+      old_stock INTEGER,
+      new_stock INTEGER,
+      synced_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
     // Create store_settings table
     await pool.query(`CREATE TABLE IF NOT EXISTS store_settings (
       key TEXT PRIMARY KEY,
