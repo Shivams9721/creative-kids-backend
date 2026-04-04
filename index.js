@@ -1463,6 +1463,49 @@ app.post('/api/orders/:id/cancel', authenticateToken, async (req, res) => {
 });
 
 
+// POST: Admin change own password
+app.post('/api/admin/change-password', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password = $1 WHERE id = $2 AND role = $3', [hashed, req.admin.id, 'admin']);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================================
+// 15. STORE SETTINGS ROUTES
+// ==========================================
+
+// GET: Fetch all store settings (public — storefront needs maintenance/cod/reviews flags)
+app.get('/api/settings', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT key, value FROM store_settings');
+    const settings = {};
+    result.rows.forEach(r => {
+      try { settings[r.key] = JSON.parse(r.value); } catch { settings[r.key] = r.value; }
+    });
+    res.json(settings);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT: Save store settings (admin only)
+app.put('/api/admin/settings', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const entries = Object.entries(req.body);
+    for (const [key, value] of entries) {
+      const serialized = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      await pool.query(
+        `INSERT INTO store_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, serialized]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==========================================
 // 11. COUPON ROUTES
 // ==========================================
@@ -1824,6 +1867,28 @@ app.listen(PORT, async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     console.log('Schema migrations complete');
+    // Create store_settings table
+    await pool.query(`CREATE TABLE IF NOT EXISTS store_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    // Insert defaults if not exist
+    const defaults = [
+      ['store_name', 'Creative Kids'],
+      ['gstin', '06AAJPM1384L1ZE'],
+      ['address', 'Plot No. 667, Pace City-II, Sector 37, Gurugram, Haryana – 122001'],
+      ['support_email', 'support@creativekids.co.in'],
+      ['maintenance_mode', 'false'],
+      ['cod_enabled', 'true'],
+      ['reviews_enabled', 'true'],
+    ];
+    for (const [key, value] of defaults) {
+      await pool.query(
+        `INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+        [key, value]
+      );
+    }
     // Fix legacy products where item_type was stored as a numeric string (old admin bug)
     // Use the category column (which has correct text) to fix item_type and sub_category
     await pool.query(`
