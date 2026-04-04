@@ -2185,10 +2185,11 @@ const getEasyEcomToken = async () => {
     body: JSON.stringify({
       email: process.env.EASYECOM_EMAIL,
       password: process.env.EASYECOM_API_KEY,
+      location: process.env.EASYECOM_WAREHOUSE_CODE || '7210',
     })
   });
   const data = await res.json();
-  if (!res.ok || !data.data?.jwt_token) throw new Error(data.message || 'EasyEcom auth failed');
+  if (!res.ok || !data.data?.jwt_token) throw new Error(data.message || JSON.stringify(data) || 'EasyEcom auth failed');
   easyecomToken = data.data.jwt_token;
   easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000); // 23 hours
   return easyecomToken;
