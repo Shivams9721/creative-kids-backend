@@ -1726,18 +1726,34 @@ app.get('/api/admin/stock-notifications', authenticateAdmin, async (req, res) =>
 app.post('/api/returns', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { order_id, order_number, reason, comments } = req.body;
+    const {
+      order_id, order_number, reason, comments,
+      refund_preference, bank_account_name, bank_account_number, bank_ifsc, bank_upi
+    } = req.body;
     if (!order_id || !reason) return res.status(400).json({ error: 'order_id and reason are required.' });
 
     // Verify the order belongs to this user and is Delivered
     const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
     const orderRes = await pool.query(
-      "SELECT id FROM orders WHERE id = $1 AND user_email = $2 AND status = 'Delivered'",
+      "SELECT id, payment_method, total_amount FROM orders WHERE id = $1 AND user_email = $2 AND status = 'Delivered'",
       [order_id, userRes.rows[0].email]
     );
     if (orderRes.rows.length === 0)
       return res.status(400).json({ error: 'Only delivered orders can be returned.' });
+
+    const order = orderRes.rows[0];
+
+    // For COD orders, bank details are required
+    if (order.payment_method === 'COD') {
+      if (refund_preference === 'bank' && (!bank_account_name || !bank_account_number || !bank_ifsc)) {
+        return res.status(400).json({ error: 'Bank account details are required for COD refunds.' });
+      }
+      if (refund_preference === 'upi' && !bank_upi) {
+        return res.status(400).json({ error: 'UPI ID is required.' });
+      }
+    }
 
     // Prevent duplicate return request
     const existing = await pool.query('SELECT id FROM returns WHERE order_id = $1 AND user_id = $2', [order_id, userId]);
@@ -1745,8 +1761,17 @@ app.post('/api/returns', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'A return request already exists for this order.' });
 
     const result = await pool.query(
-      'INSERT INTO returns (order_id, order_number, user_id, reason, comments, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [order_id, order_number, userId, reason, comments || null, 'Pending']
+      `INSERT INTO returns (
+        order_id, order_number, user_id, reason, comments, status,
+        payment_method, refund_amount, refund_preference,
+        bank_account_name, bank_account_number, bank_ifsc, bank_upi
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [
+        order_id, order_number, userId, reason, comments || null, 'Pending',
+        order.payment_method, parseFloat(order.total_amount),
+        refund_preference || (order.payment_method === 'COD' ? 'bank' : 'razorpay'),
+        bank_account_name || null, bank_account_number || null, bank_ifsc || null, bank_upi || null
+      ]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -1781,15 +1806,76 @@ app.get('/api/admin/returns', authenticateAdmin, async (req, res) => {
 });
 
 // PUT: Admin — update return status
-app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
+// PUT: Admin — update return status with full workflow
+app.put('/api/admin/returns/:id', authenticateAdmin, validateRequest, async (req, res) => {
   try {
-    const { status } = req.body;
+    const returnId = parseInt(req.params.id, 10);
+    const { status, pickup_awb } = req.body;
+
+    const returnRes = await pool.query('SELECT * FROM returns WHERE id = $1', [returnId]);
+    if (returnRes.rows.length === 0) return res.status(404).json({ error: 'Return not found' });
+    const ret = returnRes.rows[0];
+
+    let updateFields = { status };
+    let refundResult = null;
+
+    // When admin marks as "Verified" — product received and checked
+    if (status === 'Verified') {
+      updateFields.verified_at = new Date().toISOString();
+    }
+
+    // When admin marks as "Refund Initiated" — trigger actual refund
+    if (status === 'Refund Initiated') {
+      updateFields.refund_initiated_at = new Date().toISOString();
+
+      if (ret.payment_method === 'COD') {
+        // COD refund — bank transfer must be done manually (NEFT/UPI)
+        // We just record it — admin does the actual bank transfer outside the system
+        refundResult = {
+          type: 'manual_bank_transfer',
+          preference: ret.refund_preference,
+          account_name: ret.bank_account_name,
+          account_number: ret.bank_account_number,
+          ifsc: ret.bank_ifsc,
+          upi: ret.bank_upi,
+          amount: ret.refund_amount,
+          note: 'Please initiate NEFT/UPI transfer manually from your bank account'
+        };
+      } else {
+        // Online payment — Razorpay refund
+        const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [ret.order_id]);
+        if (orderRes.rows.length > 0) {
+          const order = orderRes.rows[0];
+          const paymentId = order.payment_id || order.razorpay_payment_id;
+          if (paymentId && razorpay) {
+            try {
+              const refund = await razorpay.payments.refund(paymentId, {
+                amount: Math.round(parseFloat(ret.refund_amount || order.total_amount) * 100),
+                notes: { return_id: String(returnId), order_number: ret.order_number }
+              });
+              refundResult = { type: 'razorpay', refund_id: refund.id, amount: ret.refund_amount };
+            } catch (e) {
+              refundResult = { type: 'razorpay', error: e.message };
+            }
+          }
+        }
+      }
+    }
+
+    // Save pickup AWB if provided
+    if (pickup_awb) updateFields.pickup_awb = pickup_awb;
+
+    // Build update query dynamically
+    const setClauses = Object.entries(updateFields).map(([k, v], i) => `${k} = $${i + 2}`);
+    const values = [returnId, ...Object.values(updateFields)];
     const result = await pool.query(
-      'UPDATE returns SET status = $1 WHERE id = $2 RETURNING *',
-      [status, req.params.id]
+      `UPDATE returns SET ${setClauses.join(', ')} WHERE id = $1 RETURNING *`,
+      values
     );
-    res.json(result.rows[0]);
+
+    res.json({ ...result.rows[0], refund_details: refundResult });
   } catch (err) {
+    console.error('Admin Returns Update Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2265,13 +2351,23 @@ app.listen(PORT, async () => {
       id SERIAL PRIMARY KEY,
       order_id INTEGER NOT NULL,
       order_number TEXT,
-      user_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       reason TEXT NOT NULL,
       comments TEXT,
       status TEXT DEFAULT 'Pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Pending'`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS bank_account_name TEXT`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS bank_account_number TEXT`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS bank_ifsc TEXT`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS bank_upi TEXT`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS refund_preference TEXT DEFAULT 'bank'`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS pickup_awb TEXT`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS refund_initiated_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS refund_amount NUMERIC`);
+    await pool.query(`ALTER TABLE returns ADD COLUMN IF NOT EXISTS payment_method TEXT`);
   } catch (e) {
     console.error('Table init error:', e.message);
   }
