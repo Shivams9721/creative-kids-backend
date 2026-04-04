@@ -275,7 +275,6 @@ app.get('/api/products', async (req, res) => {
   try {
     const { sub_category, main_category, new_arrival, q, item_type, baby_all, kids_all,
             sizes, colors, fabrics, patterns, necks, price_min, price_max } = req.query;
-    console.log('Products query params:', req.query);
     let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const values = [];
 
@@ -357,7 +356,6 @@ app.get('/api/products', async (req, res) => {
       query += ` AND (title ILIKE $${values.length} OR description ILIKE $${values.length} OR color ILIKE $${values.length} OR main_category ILIKE $${values.length})`;
     }
     query += ` ORDER BY id DESC LIMIT 120;`;
-    console.log('Final SQL:', query, 'Values:', values);
     const allProducts = await pool.query(query, values);
     res.json(allProducts.rows);
   } catch (err) {
