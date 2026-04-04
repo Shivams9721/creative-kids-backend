@@ -1688,6 +1688,164 @@ app.put('/api/admin/returns/:id', authenticateAdmin, async (req, res) => {
 });
 
 // ==========================================
+// 16. DELHIVERY SHIPPING ROUTES
+// ==========================================
+
+const DELHIVERY_BASE = 'https://track.delhivery.com';
+const delhiveryHeaders = () => ({
+  'Authorization': `Token ${process.env.DELHIVERY_API_TOKEN}`,
+  'Content-Type': 'application/json',
+  'Accept': 'application/json',
+});
+
+// POST: Create a Delhivery shipment for an order
+app.post('/api/admin/orders/:id/ship', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.id, 10);
+    const { weight = 500, length = 20, breadth = 15, height = 10 } = req.body;
+
+    // Fetch order details
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+
+    if (order.awb_number) return res.status(400).json({ error: 'Shipment already created for this order' });
+
+    let address = {};
+    try { address = typeof order.shipping_address === 'string' ? JSON.parse(order.shipping_address) : (order.shipping_address || {}); } catch {}
+
+    const warehouseName = process.env.DELHIVERY_WAREHOUSE_NAME || 'Creative Kids';
+
+    // Build Delhivery shipment payload
+    const shipmentData = {
+      format: 'json',
+      data: JSON.stringify({
+        shipments: [{
+          name: address.fullName || order.customer_name || 'Customer',
+          add: `${address.houseNo || ''} ${address.roadName || ''}`.trim(),
+          city: address.city || '',
+          state: address.state || '',
+          country: 'India',
+          pin: address.pincode || '',
+          phone: address.phone || order.phone || '',
+          order: order.order_number || String(order.id),
+          payment_mode: order.payment_method === 'COD' ? 'COD' : 'Prepaid',
+          cod_amount: order.payment_method === 'COD' ? parseFloat(order.total_amount) : 0,
+          total_amount: parseFloat(order.total_amount),
+          weight: weight / 1000, // grams to kg
+          shipment_length: length,
+          shipment_width: breadth,
+          shipment_height: height,
+          seller_name: 'Creative Impression',
+          seller_add: 'Plot No. 667, Pace City-II, Sector 37, Gurugram',
+          seller_city: 'Gurugram',
+          seller_state: 'Haryana',
+          seller_country: 'India',
+          seller_pin: '122001',
+          seller_inv: order.order_number || String(order.id),
+          quantity: order.items_count || 1,
+          pickup_location: { name: warehouseName },
+        }]
+      })
+    };
+
+    // Create shipment on Delhivery
+    const formBody = Object.entries(shipmentData).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+    const delhiveryRes = await fetch(`${DELHIVERY_BASE}/api/cmu/create.json`, {
+      method: 'POST',
+      headers: { ...delhiveryHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody,
+    });
+
+    const delhiveryData = await delhiveryRes.json();
+
+    if (!delhiveryRes.ok || delhiveryData.cod_error || delhiveryData.error) {
+      console.error('Delhivery error:', delhiveryData);
+      return res.status(400).json({ error: delhiveryData.error || delhiveryData.cod_error || 'Delhivery shipment creation failed' });
+    }
+
+    // Extract AWB from response
+    const packages = delhiveryData.packages || [];
+    const awb = packages[0]?.waybill || delhiveryData.waybill;
+    if (!awb) return res.status(400).json({ error: 'No AWB returned from Delhivery', raw: delhiveryData });
+
+    const trackingUrl = `https://www.delhivery.com/track/package/${awb}`;
+
+    // Save AWB to order
+    await pool.query(
+      `UPDATE orders SET awb_number = $1, courier_name = $2, status = $3, tracking_url = $4 WHERE id = $5`,
+      [awb, 'Delhivery', 'Shipped', trackingUrl, orderId]
+    );
+
+    res.json({ success: true, awb, tracking_url: trackingUrl });
+  } catch (err) {
+    console.error('Delhivery Ship Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Live tracking for an order (public — customer uses this)
+app.get('/api/tracking/:awb', async (req, res) => {
+  try {
+    const { awb } = req.params;
+    if (!awb || awb.length < 5) return res.status(400).json({ error: 'Invalid AWB' });
+
+    const trackRes = await fetch(
+      `${DELHIVERY_BASE}/api/v1/packages/json/?waybill=${awb}&verbose=true`,
+      { headers: delhiveryHeaders() }
+    );
+
+    if (!trackRes.ok) return res.status(502).json({ error: 'Tracking service unavailable' });
+
+    const data = await trackRes.json();
+    const pkg = data.ShipmentData?.[0]?.Shipment;
+
+    if (!pkg) return res.status(404).json({ error: 'Shipment not found' });
+
+    // Normalise response for frontend
+    const events = (pkg.Scans || []).map(s => ({
+      status: s.ScanDetail?.Scan || '',
+      location: s.ScanDetail?.ScannedLocation || '',
+      time: s.ScanDetail?.ScanDateTime || '',
+      instructions: s.ScanDetail?.Instructions || '',
+    })).reverse(); // most recent first
+
+    res.json({
+      awb,
+      status: pkg.Status?.Status || 'In Transit',
+      expected_delivery: pkg.ExpectedDeliveryDate || null,
+      origin: pkg.Origin || '',
+      destination: pkg.Destination || '',
+      events,
+    });
+  } catch (err) {
+    console.error('Tracking Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Check Delhivery serviceability for a pincode
+app.get('/api/delhivery/check/:pincode', async (req, res) => {
+  try {
+    const { pincode } = req.params;
+    const checkRes = await fetch(
+      `${DELHIVERY_BASE}/c/api/pin-codes/json/?filter_codes=${pincode}`,
+      { headers: delhiveryHeaders() }
+    );
+    const data = await checkRes.json();
+    const deliveryCode = data.delivery_codes?.[0];
+    res.json({
+      serviceable: !!deliveryCode,
+      cod: deliveryCode?.postal_code?.cod === 'Y',
+      prepaid: deliveryCode?.postal_code?.pre_paid === 'Y',
+      pickup: deliveryCode?.postal_code?.pickup === 'Y',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
 // 14. RAZORPAY PAYMENT ROUTES
 // ==========================================
 
@@ -1847,6 +2005,7 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_name TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS awb_number TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_url TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT`);
     // Wishlist table columns
     await pool.query(`ALTER TABLE wishlist ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
