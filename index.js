@@ -741,7 +741,7 @@ app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
 app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { cartItems, address, paymentMethod, couponCode, discountAmount } = req.body;
+    const { cartItems, address, paymentMethod, couponCode, discountAmount, paymentId, razorpayOrderId } = req.body;
     // Always derive email from the verified JWT — never trust client-supplied email
     const userRes = await client.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
     if (userRes.rows.length === 0) return res.status(401).json({ error: 'User not found' });
@@ -800,11 +800,11 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
     }
     const finalAmount = Math.max(0, serverTotal - serverDiscount);
 
-    // 3. Insert the order using only existing columns
+    // 3. Insert the order
     const result = await client.query(
-      `INSERT INTO orders (user_id, total_amount, status, payment_method, customer_name, coupon_code, discount_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id;`,
-      [req.user.id, finalAmount, 'Processing', paymentMethod, address.fullName, couponCode || null, serverDiscount]
+      `INSERT INTO orders (user_id, total_amount, status, payment_method, customer_name, coupon_code, discount_amount, payment_id, razorpay_payment_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;`,
+      [req.user.id, finalAmount, 'Processing', paymentMethod, address.fullName, couponCode || null, serverDiscount, paymentId || null, razorpayOrderId || null]
     );
     const newId = result.rows[0].id;
     const orderNumber = `Creativekids-O-${String(newId).padStart(6, '0')}`;
@@ -1439,26 +1439,133 @@ app.get('/api/admin/orders/search', authenticateAdmin, async (req, res) => {
 });
 
 
-// POST: Cancel an order (user-initiated, only if Processing)
+// POST: Admin manually trigger refund for a cancelled order
+app.post('/api/admin/orders/:id/refund', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.id, 10);
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+
+    const paymentId = order.payment_id || order.razorpay_payment_id;
+    if (!paymentId) return res.status(400).json({ error: 'No payment ID found for this order' });
+    if (order.payment_method === 'COD') return res.status(400).json({ error: 'COD orders cannot be refunded via Razorpay' });
+    if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
+
+    const refund = await razorpay.payments.refund(paymentId, {
+      amount: Math.round(parseFloat(order.total_amount) * 100),
+      notes: { order_number: order.order_number, reason: 'Admin initiated refund' }
+    });
+
+    await pool.query(
+      `UPDATE orders SET refund_id = $1, refund_status = 'Initiated', refund_amount = $2 WHERE id = $3`,
+      [refund.id, parseFloat(order.total_amount), orderId]
+    );
+
+    res.json({ success: true, refund_id: refund.id, amount: parseFloat(order.total_amount) });
+  } catch (err) {
+    console.error('Manual Refund Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST: Cancel an order (user-initiated) + auto-refund if paid online
 app.post('/api/orders/:id/cancel', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
     const userId = req.user.id;
-    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+    const { reason = 'Customer requested cancellation' } = req.body;
+
+    const userRes = await client.query('SELECT email FROM users WHERE id = $1', [userId]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     const email = userRes.rows[0].email;
 
-    const orderRes = await pool.query(
+    const orderRes = await client.query(
       'SELECT * FROM orders WHERE id = $1 AND user_email = $2',
       [req.params.id, email]
     );
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     const order = orderRes.rows[0];
-    if (order.status !== 'Processing') return res.status(400).json({ error: 'Only Processing orders can be cancelled.' });
 
-    await pool.query('UPDATE orders SET status = $1 WHERE id = $2', ['Cancelled', order.id]);
-    res.json({ success: true });
+    // Only allow cancellation before shipping
+    if (['Shipped', 'Delivered'].includes(order.status)) {
+      return res.status(400).json({ error: 'Order cannot be cancelled after it has been shipped. Please raise a return request instead.' });
+    }
+    if (order.status === 'Cancelled') {
+      return res.status(400).json({ error: 'Order is already cancelled.' });
+    }
+
+    await client.query('BEGIN');
+
+    // Cancel the order
+    await client.query(
+      `UPDATE orders SET status = 'Cancelled', cancel_reason = $1, cancelled_at = NOW() WHERE id = $2`,
+      [reason, order.id]
+    );
+
+    // Restore stock for each item
+    let items = [];
+    try { items = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch {}
+    for (const item of items) {
+      const productRes = await client.query('SELECT variants FROM products WHERE id = $1', [item.id]);
+      if (productRes.rows.length > 0) {
+        let variants = [];
+        try { variants = typeof productRes.rows[0].variants === 'string' ? JSON.parse(productRes.rows[0].variants) : (productRes.rows[0].variants || []); } catch {}
+        const restored = variants.map(v => {
+          const colorMatch = v.color === (item.selectedColor || 'Default');
+          const sizeMatch = v.size === (item.selectedSize || 'Default');
+          if (colorMatch && sizeMatch) return { ...v, stock: (parseInt(v.stock) || 0) + (item.quantity || 1) };
+          return v;
+        });
+        await client.query('UPDATE products SET variants = $1 WHERE id = $2', [JSON.stringify(restored), item.id]);
+      }
+    }
+
+    // Razorpay refund if paid online
+    let refundResult = null;
+    const paymentId = order.payment_id || order.razorpay_payment_id;
+    if (paymentId && order.payment_method !== 'COD' && razorpay) {
+      try {
+        const refund = await razorpay.payments.refund(paymentId, {
+          amount: Math.round(parseFloat(order.total_amount) * 100), // paise
+          notes: { reason, order_number: order.order_number }
+        });
+        await client.query(
+          `UPDATE orders SET refund_id = $1, refund_status = 'Initiated', refund_amount = $2 WHERE id = $3`,
+          [refund.id, parseFloat(order.total_amount), order.id]
+        );
+        refundResult = { id: refund.id, amount: parseFloat(order.total_amount), status: 'Initiated' };
+      } catch (refundErr) {
+        console.error('Razorpay refund error:', refundErr.message);
+        // Don't fail the cancellation — log and handle manually
+        await client.query(
+          `UPDATE orders SET refund_status = 'Failed', refund_notes = $1 WHERE id = $2`,
+          [refundErr.message, order.id]
+        );
+        refundResult = { error: 'Refund initiation failed. Will be processed manually within 2-3 business days.' };
+      }
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      cancelled: true,
+      refund: order.payment_method === 'COD'
+        ? null
+        : refundResult || { message: 'No payment found to refund' },
+      message: order.payment_method === 'COD'
+        ? 'Order cancelled successfully.'
+        : refundResult?.id
+          ? `Order cancelled. Refund of ₹${order.total_amount} initiated — will reach your account in 5-7 business days.`
+          : `Order cancelled. Refund will be processed manually within 2-3 business days.`
+    });
   } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Cancel Order Error:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -2080,6 +2187,14 @@ app.listen(PORT, async () => {
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_name TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS awb_number TEXT`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_url TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_id TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_status TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_amount NUMERIC`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_notes TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancel_reason TEXT`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT`);
     // Wishlist table columns
     await pool.query(`ALTER TABLE wishlist ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
