@@ -289,11 +289,15 @@ app.get('/api/products', async (req, res) => {
     }
 
     // Item type filter — checks item_type, sub_category, and category columns
-    // Also does a title ILIKE as fallback for legacy products with no item_type set
     if (item_type) {
-      values.push(item_type);
-      const ph = `$${values.length}`;
-      query += ` AND (item_type = ${ph} OR sub_category = ${ph} OR category = ${ph})`;
+      // If item_type is a number (legacy bug), skip the filter — return all products in category
+      if (/^\d+$/.test(item_type)) {
+        // numeric item_type means old data — don't filter by it, just return category products
+      } else {
+        values.push(item_type);
+        const ph = `$${values.length}`;
+        query += ` AND (item_type = ${ph} OR sub_category = ${ph} OR category = ${ph})`;
+      }
     } else if (sub_category) {
       values.push(sub_category);
       query += ` AND (sub_category = $${values.length} OR category = $${values.length})`;
@@ -1735,6 +1739,20 @@ app.post('/api/payment/status', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Temp: inspect what category values exist in DB ──────────────────────────
+app.get('/api/admin/debug/categories', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT item_type, sub_category, category, main_category, COUNT(*) as count
+      FROM products
+      GROUP BY item_type, sub_category, category, main_category
+      ORDER BY count DESC
+      LIMIT 50
+    `);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==========================================
 // GLOBAL ERROR HANDLER
 // ==========================================
@@ -1797,10 +1815,23 @@ app.listen(PORT, async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     console.log('Schema migrations complete');
-    // Backfill item_type from sub_category for legacy products that have no item_type
+    // Fix legacy products where item_type was stored as a numeric string (old admin bug)
+    // Use the category column (which has correct text) to fix item_type and sub_category
+    await pool.query(`
+      UPDATE products 
+      SET item_type = category, sub_category = category
+      WHERE item_type ~ '^[0-9]+$' AND category IS NOT NULL AND category != '' AND category != 'Uncategorized'
+    `).catch(e => console.error('item_type fix error:', e.message));
+    // Also fix main_category if it's a number
+    await pool.query(`
+      UPDATE products 
+      SET main_category = category
+      WHERE main_category ~ '^[0-9]+$' AND category IS NOT NULL AND category != ''
+    `).catch(() => {});
+    // Backfill item_type from sub_category for products with no item_type
     await pool.query(`
       UPDATE products SET item_type = sub_category
-      WHERE (item_type IS NULL OR item_type = '') AND sub_category IS NOT NULL AND sub_category != ''
+      WHERE (item_type IS NULL OR item_type = '') AND sub_category IS NOT NULL AND sub_category != '' AND sub_category != 'Uncategorized'
     `).catch(() => {});
     // Backfill main_category from category for legacy products
     await pool.query(`
