@@ -2222,10 +2222,17 @@ const skuMatchScore = (a, b) => {
 app.post('/api/admin/easyecom/connect', authenticateAdmin, validateRequest, async (req, res) => {
   try {
     easyecomToken = null; // force refresh
+    // Debug: log what we're sending
+    console.log('EasyEcom connect attempt:', {
+      email: process.env.EASYECOM_EMAIL,
+      location: process.env.EASYECOM_WAREHOUSE_CODE,
+      hasKey: !!process.env.EASYECOM_API_KEY
+    });
     const token = await getEasyEcomToken();
     await pool.query(`INSERT INTO store_settings (key, value) VALUES ('easyecom_connected', 'true') ON CONFLICT (key) DO UPDATE SET value = 'true'`);
     res.json({ success: true, message: 'EasyEcom connected successfully' });
   } catch (err) {
+    console.error('EasyEcom connect error:', err.message);
     res.status(400).json({ error: err.message });
   }
 });
