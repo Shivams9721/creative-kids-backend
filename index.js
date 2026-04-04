@@ -2012,37 +2012,28 @@ app.post('/api/admin/orders/:id/cancel-shipment', authenticateAdmin, validateReq
     res.status(500).json({ error: err.message });
   }
 });
+
 app.get('/api/tracking/:awb', async (req, res) => {
   try {
     const { awb } = req.params;
     if (!awb || awb.length < 5) return res.status(400).json({ error: 'Invalid AWB' });
-
     const trackRes = await fetch(
       `${DELHIVERY_BASE}/api/v1/packages/json/?waybill=${awb}&verbose=true`,
       { headers: delhiveryHeaders() }
     );
-
     if (!trackRes.ok) return res.status(502).json({ error: 'Tracking service unavailable' });
-
     const data = await trackRes.json();
     const pkg = data.ShipmentData?.[0]?.Shipment;
-
     if (!pkg) return res.status(404).json({ error: 'Shipment not found' });
-
-    // Normalise response for frontend
     const events = (pkg.Scans || []).map(s => ({
       status: s.ScanDetail?.Scan || '',
       location: s.ScanDetail?.ScannedLocation || '',
       time: s.ScanDetail?.ScanDateTime || '',
-      instructions: s.ScanDetail?.Instructions || '',
-    })).reverse(); // most recent first
-
+    })).reverse();
     res.json({
-      awb,
-      status: pkg.Status?.Status || 'In Transit',
+      awb, status: pkg.Status?.Status || 'In Transit',
       expected_delivery: pkg.ExpectedDeliveryDate || null,
-      origin: pkg.Origin || '',
-      destination: pkg.Destination || '',
+      origin: pkg.Origin || '', destination: pkg.Destination || '',
       events,
     });
   } catch (err) {
@@ -2051,47 +2042,6 @@ app.get('/api/tracking/:awb', async (req, res) => {
   }
 });
 
-// POST: Cancel a Delhivery shipment (only works before pickup)
-app.post('/api/admin/orders/:id/cancel-shipment', authenticateAdmin, validateRequest, async (req, res) => {
-  try {
-    const orderId = parseInt(req.params.id, 10);
-    const orderRes = await pool.query('SELECT awb_number, status FROM orders WHERE id = $1', [orderId]);
-    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
-
-    const { awb_number, status } = orderRes.rows[0];
-    if (!awb_number) return res.status(400).json({ error: 'No shipment found for this order' });
-    if (status === 'Delivered') return res.status(400).json({ error: 'Cannot cancel a delivered order' });
-
-    // Cancel on Delhivery
-    const cancelRes = await fetch(`${DELHIVERY_BASE}/api/p/edit`, {
-      method: 'POST',
-      headers: { ...delhiveryHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `format=json&data=${encodeURIComponent(JSON.stringify({ waybill: awb_number, cancellation: true }))}`,
-    });
-
-    const cancelData = await cancelRes.json();
-
-    // Delhivery returns success even if already picked up — check the response
-    if (cancelData.cancellation_status?.[0]?.status === 'Cancelled' || cancelData.success) {
-      // Update order in DB
-      await pool.query(
-        `UPDATE orders SET awb_number = NULL, courier_name = NULL, tracking_url = NULL, status = 'Processing' WHERE id = $1`,
-        [orderId]
-      );
-      res.json({ success: true, message: 'Shipment cancelled. Order moved back to Processing.' });
-    } else {
-      // Delhivery couldn't cancel (likely already picked up)
-      const reason = cancelData.cancellation_status?.[0]?.status || 'Unknown reason';
-      res.status(400).json({
-        error: `Delhivery could not cancel: ${reason}. Package may already be picked up. Contact Delhivery support.`,
-        delhivery_response: cancelData,
-      });
-    }
-  } catch (err) {
-    console.error('Cancel Shipment Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 app.get('/api/delhivery/check/:pincode', async (req, res) => {
   try {
     const { pincode } = req.params;
