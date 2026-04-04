@@ -1784,7 +1784,41 @@ app.post('/api/admin/orders/:id/ship', authenticateAdmin, validateRequest, async
   }
 });
 
-// GET: Live tracking for an order (public — customer uses this)
+// POST: Cancel a Delhivery shipment (only before pickup)
+app.post('/api/admin/orders/:id/cancel-shipment', authenticateAdmin, validateRequest, async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.id, 10);
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+
+    if (!order.awb_number) return res.status(400).json({ error: 'No AWB found for this order' });
+
+    // Cancel on Delhivery
+    const body = new URLSearchParams();
+    body.append('format', 'json');
+    body.append('data', JSON.stringify({ waybill: order.awb_number, cancellation: 'true' }));
+
+    const cancelRes = await fetch(`${DELHIVERY_BASE}/api/p/edit`, {
+      method: 'POST',
+      headers: { ...delhiveryHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    const cancelData = await cancelRes.json();
+
+    // Update order in DB regardless (Delhivery may already have cancelled it)
+    await pool.query(
+      `UPDATE orders SET status = $1, awb_number = NULL, courier_name = NULL, tracking_url = NULL WHERE id = $2`,
+      ['Cancelled', orderId]
+    );
+
+    res.json({ success: true, delhivery_response: cancelData });
+  } catch (err) {
+    console.error('Cancel Shipment Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.get('/api/tracking/:awb', async (req, res) => {
   try {
     const { awb } = req.params;
