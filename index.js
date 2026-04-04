@@ -288,13 +288,15 @@ app.get('/api/products', async (req, res) => {
       query += ` AND main_category = $${values.length}`;
     }
 
-    // Item type filter (checks both item_type and sub_category columns)
+    // Item type filter — checks item_type, sub_category, and category columns
+    // Also does a title ILIKE as fallback for legacy products with no item_type set
     if (item_type) {
       values.push(item_type);
-      query += ` AND (item_type = $${values.length} OR sub_category = $${values.length})`;
+      const ph = `$${values.length}`;
+      query += ` AND (item_type = ${ph} OR sub_category = ${ph} OR category = ${ph})`;
     } else if (sub_category) {
       values.push(sub_category);
-      query += ` AND sub_category = $${values.length}`;
+      query += ` AND (sub_category = $${values.length} OR category = $${values.length})`;
     }
 
     // Price range
@@ -1795,6 +1797,16 @@ app.listen(PORT, async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     console.log('Schema migrations complete');
+    // Backfill item_type from sub_category for legacy products that have no item_type
+    await pool.query(`
+      UPDATE products SET item_type = sub_category
+      WHERE (item_type IS NULL OR item_type = '') AND sub_category IS NOT NULL AND sub_category != ''
+    `).catch(() => {});
+    // Backfill main_category from category for legacy products
+    await pool.query(`
+      UPDATE products SET main_category = category
+      WHERE (main_category IS NULL OR main_category = '') AND category IS NOT NULL AND category != ''
+    `).catch(() => {});
     // Ensure returns table has status column
     await pool.query(`CREATE TABLE IF NOT EXISTS returns (
       id SERIAL PRIMARY KEY,
