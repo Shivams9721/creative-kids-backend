@@ -777,7 +777,7 @@ app.post("/api/orders", authenticateToken, validateRequest, async (req, res) => 
       });
       await client.query("UPDATE products SET variants = $1 WHERE id = $2", [JSON.stringify(updated), item.id]);
 
-      enrichedItems.push({ ...item, price: parseFloat(product.price), title: product.title });
+      enrichedItems.push({ ...item, price: parseFloat(product.price), title: product.title, image: item.image || null });
     }
 
     // 2. Server-side coupon validation — never trust client-supplied discountAmount
