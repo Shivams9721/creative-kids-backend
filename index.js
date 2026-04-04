@@ -278,14 +278,23 @@ app.get('/api/products', async (req, res) => {
     let query = `SELECT * FROM products WHERE is_active = true AND (is_draft = false OR is_draft IS NULL)`;
     const values = [];
 
-    // Category filters
+    // Category filters — handle both new format (Baby boys/Girls clothing) and legacy (Baby/Kids)
     if (baby_all === 'true') {
-      query += ` AND main_category IN ('Baby boys', 'Baby girls')`;
+      query += ` AND main_category IN ('Baby boys', 'Baby girls', 'Baby')`;
     } else if (kids_all === 'true') {
-      query += ` AND main_category IN ('Boys clothing', 'Girls clothing')`;
+      query += ` AND main_category IN ('Boys clothing', 'Girls clothing', 'Kids')`;
     } else if (main_category) {
-      values.push(main_category);
-      query += ` AND main_category = $${values.length}`;
+      // Map legacy values to new format for filtering
+      const legacyMap = {
+        'Baby boys':     ["Baby boys", "Baby"],
+        'Baby girls':    ["Baby girls", "Baby"],
+        'Boys clothing': ["Boys clothing", "Kids"],
+        'Girls clothing':["Girls clothing", "Kids"],
+      };
+      const matchValues = legacyMap[main_category] || [main_category];
+      values.push(...matchValues);
+      const placeholders = matchValues.map((_, i) => `$${values.length - matchValues.length + 1 + i}`);
+      query += ` AND main_category IN (${placeholders.join(', ')})`;
     }
 
     // Item type filter — checks item_type, sub_category, and category columns
@@ -1822,7 +1831,7 @@ app.listen(PORT, async () => {
       SET item_type = category, sub_category = category
       WHERE item_type ~ '^[0-9]+$' AND category IS NOT NULL AND category != '' AND category != 'Uncategorized'
     `).catch(e => console.error('item_type fix error:', e.message));
-    // Also fix main_category if it's a number
+    // Fix legacy main_category numeric values using category column
     await pool.query(`
       UPDATE products 
       SET main_category = category
