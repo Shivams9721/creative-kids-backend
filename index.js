@@ -2179,19 +2179,25 @@ const getEasyEcomToken = async () => {
   if (easyecomToken && easyecomTokenExpiry && Date.now() < easyecomTokenExpiry) {
     return easyecomToken;
   }
+  // Try without location_key first — EasyEcom may not require it for all accounts
+  const body = {
+    email: process.env.EASYECOM_EMAIL,
+    password: process.env.EASYECOM_PASSWORD,
+  };
+  // Only add location_key if explicitly set
+  if (process.env.EASYECOM_WAREHOUSE_CODE) {
+    body.location_key = process.env.EASYECOM_WAREHOUSE_CODE;
+  }
   const res = await fetch(`${EASYECOM_BASE}/access/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': process.env.EASYECOM_API_KEY,
     },
-    body: JSON.stringify({
-      email: process.env.EASYECOM_EMAIL,
-      password: process.env.EASYECOM_PASSWORD || process.env.EASYECOM_API_KEY,
-      location_key: process.env.EASYECOM_WAREHOUSE_CODE || 've11697504025',
-    })
+    body: JSON.stringify(body)
   });
   const data = await res.json();
+  console.log('EasyEcom token response:', JSON.stringify(data).slice(0, 400));
   if (!res.ok || !data.data?.jwt_token) throw new Error(data.message || JSON.stringify(data) || 'EasyEcom auth failed');
   easyecomToken = data.data.jwt_token;
   easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
