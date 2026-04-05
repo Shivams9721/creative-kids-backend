@@ -2181,18 +2181,20 @@ const getEasyEcomToken = async () => {
   }
   const res = await fetch(`${EASYECOM_BASE}/access/token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.EASYECOM_API_KEY,
+    },
     body: JSON.stringify({
       email: process.env.EASYECOM_EMAIL,
-      password: process.env.EASYECOM_API_KEY,
-      location: process.env.EASYECOM_WAREHOUSE_CODE || '7210',
-      location_key: process.env.EASYECOM_WAREHOUSE_CODE || '7210',
+      password: process.env.EASYECOM_PASSWORD,
+      location_key: process.env.EASYECOM_WAREHOUSE_CODE || 've11697504025',
     })
   });
   const data = await res.json();
   if (!res.ok || !data.data?.jwt_token) throw new Error(data.message || JSON.stringify(data) || 'EasyEcom auth failed');
   easyecomToken = data.data.jwt_token;
-  easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000); // 23 hours
+  easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
   return easyecomToken;
 };
 
