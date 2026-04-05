@@ -2185,8 +2185,9 @@ const getEasyEcomToken = async () => {
     password: process.env.EASYECOM_PASSWORD,
   };
   // Only add location_key if explicitly set
-  if (process.env.EASYECOM_WAREHOUSE_CODE) {
-    body.location_key = process.env.EASYECOM_WAREHOUSE_CODE;
+  const locationKey = process.env.EASYECOM_LOCATION_KEY || process.env.EASYECOM_WAREHOUSE_CODE;
+  if (locationKey) {
+    body.location_key = locationKey;
   }
   const res = await fetch(`${EASYECOM_BASE}/access/token`, {
     method: 'POST',
@@ -2230,16 +2231,41 @@ const skuMatchScore = (a, b) => {
 // POST: Connect EasyEcom (test credentials)
 app.post('/api/admin/easyecom/connect', authenticateAdmin, validateRequest, async (req, res) => {
   try {
+    // Allow overriding credentials from request body for testing
+    const testEmail = req.body.email || process.env.EASYECOM_EMAIL;
+    const testPassword = req.body.password || process.env.EASYECOM_PASSWORD;
+    const testLocationKey = req.body.location_key || process.env.EASYECOM_LOCATION_KEY || process.env.EASYECOM_WAREHOUSE_CODE;
+    const testApiKey = req.body.api_key || process.env.EASYECOM_API_KEY;
+
     easyecomToken = null; // force refresh
-    // Debug: log what we're sending
+
+    const body = { email: testEmail, password: testPassword };
+    if (testLocationKey) body.location_key = testLocationKey;
+
     console.log('EasyEcom connect attempt:', {
-      email: process.env.EASYECOM_EMAIL,
-      location: process.env.EASYECOM_WAREHOUSE_CODE,
-      hasKey: !!process.env.EASYECOM_API_KEY,
-      hasPassword: !!process.env.EASYECOM_PASSWORD,
-      passwordLength: process.env.EASYECOM_PASSWORD?.length || 0
+      email: testEmail,
+      location_key: testLocationKey,
+      hasKey: !!testApiKey,
+      hasPassword: !!testPassword,
+      passwordLength: testPassword?.length || 0
     });
-    const token = await getEasyEcomToken();
+
+    const res2 = await fetch(`${EASYECOM_BASE}/access/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': testApiKey },
+      body: JSON.stringify(body)
+    });
+    const data = await res2.json();
+    console.log('EasyEcom token response:', JSON.stringify(data).slice(0, 400));
+
+    if (!res2.ok || !data.data?.jwt_token) {
+      return res.status(400).json({ error: data.message || JSON.stringify(data) });
+    }
+
+    // Save working credentials
+    easyecomToken = data.data.jwt_token;
+    easyecomTokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+
     await pool.query(`INSERT INTO store_settings (key, value) VALUES ('easyecom_connected', 'true') ON CONFLICT (key) DO UPDATE SET value = 'true'`);
     res.json({ success: true, message: 'EasyEcom connected successfully' });
   } catch (err) {
@@ -2269,7 +2295,7 @@ app.get('/api/admin/easyecom/status', authenticateAdmin, async (req, res) => {
 app.post('/api/admin/easyecom/sync', authenticateAdmin, async (req, res) => {
   try {
     const headers = await easyecomHeaders();
-    const warehouseCode = process.env.EASYECOM_WAREHOUSE_CODE || '7210';
+    const warehouseCode = process.env.EASYECOM_LOCATION_KEY || process.env.EASYECOM_WAREHOUSE_CODE || '7210';
 
     // Fetch inventory from EasyEcom (paginated)
     let page = 1, allItems = [];
