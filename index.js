@@ -2234,7 +2234,7 @@ app.post('/api/admin/easyecom/connect', authenticateAdmin, validateRequest, asyn
     // Allow overriding credentials from request body for testing
     const testEmail = req.body.email || process.env.EASYECOM_EMAIL;
     const testPassword = req.body.password || process.env.EASYECOM_PASSWORD;
-    const testLocationKey = req.body.location_key || process.env.EASYECOM_LOCATION_KEY || process.env.EASYECOM_WAREHOUSE_CODE || 've11697504025';
+    const testLocationKey = req.body.location_key || process.env.EASYECOM_LOCATION_KEY || process.env.EASYECOM_WAREHOUSE_CODE || 'en11628818569';
     const testApiKey = req.body.api_key || process.env.EASYECOM_API_KEY;
 
     easyecomToken = null; // force refresh
