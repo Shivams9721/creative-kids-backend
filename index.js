@@ -2187,7 +2187,7 @@ const getEasyEcomToken = async () => {
     },
     body: JSON.stringify({
       email: process.env.EASYECOM_EMAIL,
-      password: process.env.EASYECOM_PASSWORD,
+      password: process.env.EASYECOM_PASSWORD || process.env.EASYECOM_API_KEY,
       location_key: process.env.EASYECOM_WAREHOUSE_CODE || 've11697504025',
     })
   });
