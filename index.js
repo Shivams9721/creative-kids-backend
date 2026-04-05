@@ -2229,7 +2229,9 @@ app.post('/api/admin/easyecom/connect', authenticateAdmin, validateRequest, asyn
     console.log('EasyEcom connect attempt:', {
       email: process.env.EASYECOM_EMAIL,
       location: process.env.EASYECOM_WAREHOUSE_CODE,
-      hasKey: !!process.env.EASYECOM_API_KEY
+      hasKey: !!process.env.EASYECOM_API_KEY,
+      hasPassword: !!process.env.EASYECOM_PASSWORD,
+      passwordLength: process.env.EASYECOM_PASSWORD?.length || 0
     });
     const token = await getEasyEcomToken();
     await pool.query(`INSERT INTO store_settings (key, value) VALUES ('easyecom_connected', 'true') ON CONFLICT (key) DO UPDATE SET value = 'true'`);
